@@ -3,3 +3,4 @@ repos/
 __pycache__/
 *.sqlite
 .DS_Store
+graphify-out
