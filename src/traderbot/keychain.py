@@ -16,7 +16,11 @@ class AlpacaKeys:
 
 def _read(account: str) -> str:
     argv = [SECURITY_BIN, "find-generic-password", "-s", SERVICE, "-a", account, "-w"]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT_S, check=False)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT_S, check=False)
+    except subprocess.TimeoutExpired:
+        # `from None` drops the timeout exception, whose .stdout may hold part of the value.
+        raise RuntimeError(f"Keychain read of {SERVICE}/{account} timed out") from None
     if proc.returncode != 0:
         # stderr names the item, never the value; the value is only ever on stdout.
         raise RuntimeError(

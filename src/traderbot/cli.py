@@ -68,11 +68,17 @@ def propose(
     keys = keychain.load()
     trading = broker.client(keys)
     bars = data.daily_bars(trading, keys, symbol, now)
+    if bars.stale:
+        raise Refused(
+            f"bars are stale: latest complete {symbol} bar is {bars.bar_date}, last closed session"
+            f" {bars.as_of}; no desk call made"
+        )
     result = decide(bars)
     limit, qty = prop.size(bars.last_close, limits.max_notional, limits.band)
     choice = result.choice
     card = prop.Proposal(
         symbol=choice.symbol if choice else symbol,
+        requested_symbol=symbol,
         side=choice.side if choice else "review",
         rationale=choice.rationale if choice else str(result.review_reason),
         confidence=choice.confidence if choice else None,
@@ -87,7 +93,8 @@ def propose(
         model=desk.MODEL,
         created_at=now,
     )
-    verdict = gate.check(card, symbol, _snapshot(trading, conn, now, bars.as_of, None), limits, now)
+    snapshot = _snapshot(trading, conn, now, bars.as_of, None)
+    verdict = gate.check(card, card.requested_symbol, snapshot, limits, now)
     key = ledger.insert_card(conn, card, result.cost_usd, result.model_usage, verdict)
     return ledger.find(conn, key)
 
@@ -98,7 +105,7 @@ def approve(prefix: str, limits: gate.Limits = LIMITS) -> Order:
         card = ledger.find(conn, prefix)
     except (LookupError, ValueError) as err:
         raise Refused(str(err)) from err
-    if prop.digest(card.proposal) != card.digest:
+    if prop.digest_of(card.proposal_json) != card.digest:
         raise Refused(f"card {card.digest[:8]} was altered after it was stored; refusing")
     if not card.allowed:
         raise Refused(f"card {card.digest[:8]} was denied at propose: {', '.join(card.reasons)}")
@@ -111,7 +118,7 @@ def approve(prefix: str, limits: gate.Limits = LIMITS) -> Order:
     window = data.sessions(trading, now.date() - timedelta(days=10), now.date())
     expected = data.last_closed(window, now).day
     snapshot = _snapshot(trading, conn, now, expected, card.digest)
-    verdict = gate.check(card.proposal, card.proposal.symbol, snapshot, limits, now)
+    verdict = gate.check(card.proposal, card.proposal.requested_symbol, snapshot, limits, now)
     if isinstance(verdict, gate.Deny):
         raise Refused(f"gate denies card {card.digest[:8]} now: {', '.join(verdict.reasons)}")
     placed = broker.submit_limit_buy(trading, card.proposal, card.digest)

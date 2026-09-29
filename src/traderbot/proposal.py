@@ -32,7 +32,8 @@ class DeskChoice(BaseModel):
 
 @dataclass(frozen=True)
 class Proposal:
-    symbol: str
+    symbol: str  # the desk's answer; the gate compares it with requested_symbol
+    requested_symbol: str  # what `propose` was asked for; "" on cards stored before it existed
     side: str
     rationale: str
     confidence: float | None  # None only on review
@@ -74,14 +75,19 @@ def canonical(proposal: Proposal) -> str:
     return json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def digest_of(text: str) -> str:
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
 def digest(proposal: Proposal) -> str:
-    return hashlib.sha256(canonical(proposal).encode("ascii")).hexdigest()
+    return digest_of(canonical(proposal))
 
 
 def from_json(text: str) -> Proposal:
     raw = json.loads(text)
     return Proposal(
         symbol=raw["symbol"],
+        requested_symbol=raw.get("requested_symbol", ""),
         side=raw["side"],
         rationale=raw["rationale"],
         confidence=raw["confidence"],

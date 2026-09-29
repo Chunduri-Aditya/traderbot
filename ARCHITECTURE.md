@@ -4,7 +4,7 @@ _How it is built. Committed. Update in the same commit as any change to the flow
 
 ## Flow
 - propose: `keychain` keys, then `data` (calendar sets `as_of`, SIP daily bars), then `desk` (one clean claude call, schema only), then `proposal` (code sizes qty and limit, sha256 digest), then `gate` (pure verdict), then `ledger` (card row).
-- approve: `ledger` card, digest recomputed, then `broker` lookup by client id (return it if found), else `gate` rerun on live account state, then a DAY limit buy on the paper host.
+- approve: `ledger` card, sha256 of the stored text checked against its key, then `broker` lookup by client id (return it if found), else `gate` rerun on live account state against the signed `requested_symbol`, then a DAY limit buy on the paper host.
 
 ## Stack
 - Python 3.13 (`>=3.12`), uv with `uv_build`: Aditya's default stack.

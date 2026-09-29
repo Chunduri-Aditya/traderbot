@@ -9,6 +9,11 @@
 The split is a runbook delta (2026-09-29): with the order half behind the desk, a desk that held
 SPY, IWM and QQQ six times in a row left approve unproven. Traderbot is never checked against its
 own helpers: the calendar, the close and the order are all read back here independently.
+
+Run it after the close. From a session close until 16 minutes later the newest bar is not served
+whole yet, so propose refuses stale bars and both halves fail. During a session the limit sits
+above the last close and can fill at once, which leaves about $1,000 of SPY on the paper account;
+teardown cancels open orders only and never sells.
 """
 
 import uuid
@@ -28,7 +33,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest
 
-from traderbot import cli, keychain
+from traderbot import cli, keychain, ledger
 from traderbot.data import Bars
 from traderbot.desk import DeskResult
 from traderbot.proposal import DeskChoice
@@ -41,7 +46,7 @@ SYMBOL = "SPY"
 MAX_NOTIONAL = Decimal(1000)  # Aditya's Phase 1 numbers, written here, not read from gate.py
 BAND = Decimal("0.005")
 PLACED = {"accepted", "new", "pending_new", "partially_filled", "filled"}
-DONE = {"filled", "canceled", "expired", "rejected", "pending_cancel"}
+OPEN = {"accepted", "new", "pending_new", "partially_filled", "held", "accepted_for_bidding"}
 
 
 @pytest.fixture
@@ -112,7 +117,7 @@ def placed_client_ids(alpaca: TradingClient) -> Iterator[list[str]]:
             if err.status_code == 404:
                 continue
             raise
-        if order.status.value not in DONE:
+        if order.status.value in OPEN:
             alpaca.cancel_order_by_id(order.id)
 
 
@@ -137,7 +142,7 @@ def test_desk_half_reads_live_data_and_the_pinned_model(
     card = cli.propose(SYMBOL)
 
     if card.proposal.side not in ("buy", "hold"):
-        pytest.fail(f"desk gave {card.proposal.side}: {card.proposal.rationale}")
+        pytest.fail(f"desk gave {card.proposal.side}: {cli.shown(card.proposal.rationale)}")
     assert card.proposal.as_of == expected_as_of
     assert card.proposal.bar_date == expected_as_of
     assert len(card.digest) == 64 and all(ch in "0123456789abcdef" for ch in card.digest)
@@ -175,6 +180,9 @@ def test_order_half_places_one_paper_order_and_approve_is_idempotent(
     assert read.type.value == "limit" and read.time_in_force.value == "day"
     assert Decimal(read.qty) == card.proposal.qty
     assert Decimal(read.limit_price) == card.proposal.limit_price
+
+    stored = ledger.find(ledger.connect(), card.digest)
+    assert (stored.order_id, stored.order_status) == (str(first.id), first.status.value)
 
     second = cli.approve(card.digest[:8])
     assert second.id == first.id

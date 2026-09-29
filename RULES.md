@@ -19,7 +19,7 @@ _Conventions for code in this repo. Imported by `CLAUDE.md`, so it loads every s
 - No `skip` in `tests/test_smoke.py`: a REVIEW fails the desk half with the desk's reason, and the order half never depends on the desk choosing buy.
 
 ## Errors
-- A deliberate stop (spend cap, tamper, gate deny, bad prefix) is `cli.Refused`: one line on stderr, exit 1. Anything else propagates with its traceback.
+- A deliberate stop (spend cap, stale bars, tamper, gate deny, bad prefix) is `cli.Refused`: one line on stderr, exit 1. Anything else propagates with its traceback.
 - Any desk failure (timeout, bad JSON, error envelope, stop reason, model mismatch, schema) is a REVIEW card, charged at the call cap when the cost is missing.
 
 ## Constraints
