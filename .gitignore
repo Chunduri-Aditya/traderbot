@@ -1,0 +1,5 @@
+repos/
+.venv/
+__pycache__/
+*.sqlite
+.DS_Store
