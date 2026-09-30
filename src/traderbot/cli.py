@@ -107,8 +107,11 @@ def propose(
     raw_symbol: str,
     limits: gate.Limits = LIMITS,
     decide: Callable[[data.Bars, int], desk.DeskResult] = desk.decide,
+    desk_label: str = "single",
 ) -> ledger.Card:
-    """`decide` is the desk; the live approve test passes a code built buy so no model runs."""
+    """`decide` is the desk. A code built buy (the live order test, the Phase 2 positive
+    control) passes its own `decide` and a `desk_label` other than "single", which the card
+    carries under its digest so scoring can leave it out."""
     symbol = _symbol(raw_symbol)
     now = data.now_et()
     conn = ledger.connect()
@@ -151,7 +154,7 @@ def propose(
         as_of=bars.as_of,
         bar_date=bars.bar_date,
         last_close=bars.last_close,
-        desk="single",
+        desk=desk_label,
         model=desk.MODEL,
         created_at=now,
         expires_at=expires_at,

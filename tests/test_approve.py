@@ -323,3 +323,11 @@ def test_card_fields_survive_a_round_trip_through_the_ledger(conn: sqlite3.Conne
     card = replace(a_card(), side="sell", limit_price=Decimal("760.38"))
     key = store(conn, card, gate.Allow())
     assert ledger.find(conn, key).proposal == card
+
+
+def test_a_control_card_is_labelled_so_scoring_can_leave_it_out(
+    conn: sqlite3.Connection, live_stubs: None, fresh_bars: None
+) -> None:
+    card = cli.propose("SPY", decide=desk_says("buy"), desk_label="control")
+    assert card.proposal.desk == "control"
+    assert cli.propose("SPY", decide=desk_says("hold")).proposal.desk == "single"

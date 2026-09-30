@@ -193,7 +193,7 @@ def test_order_half_places_one_paper_order_and_approve_is_idempotent(
 ) -> None:
     started = datetime.now(ET)
 
-    card = cli.propose(SYMBOL, decide=code_built_buy)
+    card = cli.propose(SYMBOL, decide=code_built_buy, desk_label="test")
 
     assert card.proposal.side == "buy"
     assert card.model_usage == () and card.total_cost_usd == 0
