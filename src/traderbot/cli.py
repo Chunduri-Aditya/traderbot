@@ -323,6 +323,7 @@ def card_view(card: ledger.Card) -> dict[str, Any]:
         "symbol": p.symbol,
         "requested_symbol": p.requested_symbol,
         "side": p.side,
+        "desk": p.desk,
         "qty": p.qty,
         "limit_price": str(p.limit_price),
         "rationale": p.rationale,
