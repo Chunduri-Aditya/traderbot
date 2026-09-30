@@ -204,3 +204,16 @@ def test_breaker_condition_reads_both_limits() -> None:
 def test_breaker_condition_on_a_zero_peak_trips() -> None:
     zero = a_snapshot(equity=Decimal(0), equity_peak=Decimal(0))
     assert gate.breaker_condition(zero, LIMITS)
+
+
+def test_buying_power_does_not_bind_a_sell() -> None:
+    sell = a_card(side="sell", limit_price=Decimal("760.38"))
+    held = a_snapshot(position_qty=1, position_value=Decimal("764.20"), buying_power=Decimal(0))
+    assert gate.check(sell, "SPY", held, LIMITS, NOW).allowed
+
+
+def test_position_cap_does_not_block_a_sell() -> None:
+    # A position over 10% of equity may always be reduced.
+    sell = a_card(side="sell", limit_price=Decimal("760.38"))
+    held = a_snapshot(position_qty=30, position_value=Decimal("22926.00"))
+    assert gate.check(sell, "SPY", held, LIMITS, NOW).allowed
