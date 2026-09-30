@@ -10,7 +10,7 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 - [x] `uv run traderbot propose SPY` and `status` on the real ledger (card `f5cd6072`, a hold, so nothing to approve; the positive approve control moves to Phase 2).
 - [x] Six docs pass `check_project_docs.py`; `repos/` is untracked.
 - [x] Fresh Fable review: signed `requested_symbol`, stale bars refused before the desk, approve refusal paths tested offline with mutation rows red.
-- [ ] `Bash(/usr/bin/security find-generic-password:*)` in the project deny list (Aditya; the classifier refuses the agent's settings edit).
+- [x] `Bash(/usr/bin/security find-generic-password:*)` in the project deny list (added by Aditya; the classifier refuses the agent's settings edit).
 
 ## Phase 2: gate and approval
 - [ ] All reason codes with deny and allow tests; `/dev/tty` approval; kill switch; spend reservations; append only audit log; `scripts/check.sh` all zeros; every mutation row red.

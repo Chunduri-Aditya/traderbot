@@ -5,7 +5,8 @@
     "deny": [
       "Bash(uv run traderbot approve:*)",
       "Bash(traderbot approve:*)",
-      "Bash(security find-generic-password:*)"
+      "Bash(security find-generic-password:*)",
+      "Bash(/usr/bin/security find-generic-password:*)"
     ]
   }
 }
