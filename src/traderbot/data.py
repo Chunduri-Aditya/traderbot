@@ -82,6 +82,14 @@ def last_closed(all_sessions: list[Session], now: datetime) -> Session:
     return max(closed, key=lambda s: s.close)
 
 
+def next_close(all_sessions: list[Session], now: datetime) -> datetime:
+    """The first session close after `now`: when a card proposed at `now` expires."""
+    later = [s.close for s in all_sessions if s.close > now]
+    if not later:
+        raise RuntimeError(f"no session close after {now.isoformat()} in the calendar window")
+    return min(later)
+
+
 def complete_closes(
     raw: list[tuple[date, Decimal]], as_of: Session, data_end: datetime
 ) -> list[tuple[date, Decimal]]:

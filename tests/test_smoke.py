@@ -19,7 +19,7 @@ teardown cancels open orders only and never sells.
 import uuid
 from collections.abc import Iterator
 from datetime import date, datetime, time, timedelta
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,10 +27,12 @@ import pytest
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.models.bars import BarSet
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.models import Order, Position, TradeAccount
 from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest
 
 from traderbot import cli, keychain, ledger
@@ -86,15 +88,39 @@ def raw_close(keys: keychain.AlpacaKeys, day: date, now: datetime) -> Decimal:
         adjustment=Adjustment.RAW,
     )
     bars = StockHistoricalDataClient(keys.key_id, keys.secret).get_stock_bars(request)
+    assert isinstance(bars, BarSet)
     closes = [b.close for b in bars.data[SYMBOL] if b.timestamp.astimezone(ET).date() == day]
     assert len(closes) == 1, f"want one {SYMBOL} bar on {day}, got {len(closes)}"
     return Decimal(str(closes[0]))
 
 
-def spec_size(close: Decimal) -> tuple[Decimal, int]:
-    """The spec's sizing: limit floored to the cent above $1, qty = floor(max notional / limit)."""
-    limit = (close * (1 + BAND) / Decimal("0.01")).to_integral_value(ROUND_FLOOR) * Decimal("0.01")
+def spec_size(close: Decimal, side: str, held: int) -> tuple[Decimal, int]:
+    """The spec's sizing above $1: a buy (or a hold, as a counterfactual buy) floors the limit
+    to the cent above the close, a sell ceils it to the cent below; qty = floor(max / limit),
+    and a sell never exceeds the shares held."""
+    cent = Decimal("0.01")
+    if side == "sell":
+        limit = (close * (1 - BAND) / cent).to_integral_value(ROUND_CEILING) * cent
+        return limit, min(held, int((MAX_NOTIONAL / limit).to_integral_value(ROUND_FLOOR)))
+    limit = (close * (1 + BAND) / cent).to_integral_value(ROUND_FLOOR) * cent
     return limit, int((MAX_NOTIONAL / limit).to_integral_value(ROUND_FLOOR))
+
+
+def shares_held(alpaca: TradingClient) -> int:
+    try:
+        held = alpaca.get_open_position(SYMBOL)
+    except APIError as err:
+        if err.status_code == 404:
+            return 0
+        raise
+    assert isinstance(held, Position)
+    return int(Decimal(held.qty))
+
+
+def order_read(alpaca: TradingClient, client_id: str) -> Order:
+    order = alpaca.get_order_by_client_id(client_id)
+    assert isinstance(order, Order)
+    return order
 
 
 def orders_with_client_id(alpaca: TradingClient, client_id: str, since: datetime) -> list[object]:
@@ -112,7 +138,7 @@ def placed_client_ids(alpaca: TradingClient) -> Iterator[list[str]]:
     yield client_ids
     for client_id in client_ids:
         try:
-            order = alpaca.get_order_by_client_id(client_id)
+            order = order_read(alpaca, client_id)
         except APIError as err:
             if err.status_code == 404:
                 continue
@@ -121,7 +147,7 @@ def placed_client_ids(alpaca: TradingClient) -> Iterator[list[str]]:
             alpaca.cancel_order_by_id(order.id)
 
 
-def code_built_buy(bars: Bars) -> DeskResult:
+def code_built_buy(bars: Bars, position_qty: int = 0) -> DeskResult:
     choice = DeskChoice(
         symbol=bars.symbol,
         side="buy",
@@ -135,14 +161,17 @@ def test_desk_half_reads_live_data_and_the_pinned_model(
     home: Path, keys: keychain.AlpacaKeys, alpaca: TradingClient
 ) -> None:
     account = alpaca.get_account()
+    assert isinstance(account, TradeAccount)
     assert account.account_number.startswith("PA"), "not the paper account prefix"
     started = datetime.now(ET)
     expected_as_of = last_closed_session(alpaca, started)
+    held = shares_held(alpaca)
 
     card = cli.propose(SYMBOL)
 
-    if card.proposal.side not in ("buy", "hold"):
-        pytest.fail(f"desk gave {card.proposal.side}: {cli.shown(card.proposal.rationale)}")
+    side = card.proposal.side
+    if side not in ("buy", "sell", "hold"):
+        pytest.fail(f"desk gave {side}: {cli.shown(card.proposal.rationale)}")
     assert card.proposal.as_of == expected_as_of
     assert card.proposal.bar_date == expected_as_of
     assert len(card.digest) == 64 and all(ch in "0123456789abcdef" for ch in card.digest)
@@ -150,11 +179,13 @@ def test_desk_half_reads_live_data_and_the_pinned_model(
     assert Decimal(0) < card.total_cost_usd <= Decimal("0.25")
     close = raw_close(keys, expected_as_of, started)
     assert card.proposal.last_close == close
-    assert (card.proposal.limit_price, card.proposal.qty) == spec_size(close)
-    if card.proposal.side == "buy":
-        assert card.allowed, f"gate denied a buy: {card.reasons}"
-    else:
+    assert (card.proposal.limit_price, card.proposal.qty) == spec_size(close, side, held)
+    if side == "hold":
         assert card.reasons == ("SIDE_NOT_ALLOWED",)
+    elif side == "sell" and held == 0:
+        assert card.reasons == ("QTY_ZERO",)
+    else:
+        assert card.allowed, f"gate denied a {side}: {card.reasons}"
 
 
 def test_order_half_places_one_paper_order_and_approve_is_idempotent(
@@ -171,15 +202,16 @@ def test_order_half_places_one_paper_order_and_approve_is_idempotent(
     placed_client_ids.append(card.digest)
     first = cli.approve(card.digest[:8])
 
-    read = alpaca.get_order_by_client_id(card.digest)
+    read = order_read(alpaca, card.digest)
     assert isinstance(read.id, uuid.UUID)
     assert read.id == first.id
     assert read.client_order_id == card.digest
     assert read.status.value in PLACED
-    assert read.symbol == SYMBOL and read.side.value == "buy"
-    assert read.type.value == "limit" and read.time_in_force.value == "day"
-    assert Decimal(read.qty) == card.proposal.qty
-    assert Decimal(read.limit_price) == card.proposal.limit_price
+    assert read.symbol == SYMBOL and read.side is not None and read.side.value == "buy"
+    assert read.type is not None and read.type.value == "limit"
+    assert read.time_in_force.value == "day"
+    assert Decimal(str(read.qty)) == card.proposal.qty
+    assert Decimal(str(read.limit_price)) == card.proposal.limit_price
 
     stored = ledger.find(ledger.connect(), card.digest)
     assert (stored.order_id, stored.order_status) == (str(first.id), first.status.value)

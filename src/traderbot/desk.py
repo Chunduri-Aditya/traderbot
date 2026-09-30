@@ -7,8 +7,10 @@ hold. The profile follows twin's clean profile (/Users/chunduri/Desktop/twin/src
 flags at 46-60, env at 25 and 200-205, stop reasons at 67-70), rebuilt here.
 """
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ MODEL = "claude-sonnet-5-5"
 EFFORT = "low"
 CALL_CAP_USD = Decimal("0.25")
 TIMEOUT_S = 300
+REAP_S = 5  # after the group kill, how long to wait for the pipes to close
 ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR")
 CLEAN_FLAGS = (
     "-p",
@@ -74,15 +77,17 @@ def env() -> dict[str, str]:
     return allowed | {"NO_COLOR": "1"}
 
 
-def prompt(bars: Bars) -> str:
+def prompt(bars: Bars, position_qty: int = 0) -> str:
     rows = "\n".join(f"{day.isoformat()} {close}" for day, close in bars.closes)
     return (
         "You are the single analyst desk of a personal paper trading bot. Decide whether to buy "
         f"{bars.symbol} with a DAY limit order just above the last close, to hold for about 5 "
-        "sessions, or to hold off.\n\n"
+        "sessions; to sell shares already held with a DAY limit order just below it; or to hold "
+        "off.\n\n"
+        f"Shares of {bars.symbol} held now: {position_qty}. Selling more than that is refused.\n\n"
         f"Daily raw closes for {bars.symbol}, oldest first; the last complete session is "
         f"{bars.as_of.isoformat()}:\n{rows}\n\n"
-        f"Answer through the schema: symbol (exactly {bars.symbol}), side (buy or hold), "
+        f"Answer through the schema: symbol (exactly {bars.symbol}), side (buy, sell or hold), "
         "rationale (two or three sentences on the evidence above), confidence (0 to 1, your "
         "probability that the decision is right)."
     )
@@ -129,19 +134,39 @@ def parse(stdout: str, returncode: int) -> DeskResult:
     return DeskResult(choice=choice, review_reason=None, cost_usd=cost, model_usage=usage)
 
 
-def decide(bars: Bars) -> DeskResult:
-    with tempfile.TemporaryDirectory(prefix="traderbot-desk-") as cwd:
+def _run_claude(
+    command: list[str], stdin: str, cwd: str, environ: dict[str, str], timeout_s: int
+) -> tuple[str, int, bool]:
+    """(stdout, exit code, timed out). The child leads its own process group, and a timeout kills
+    the whole group, so nothing it started outlives the call."""
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        cwd=cwd,
+        env=environ,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = proc.communicate(stdin, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
         try:
-            proc = subprocess.run(
-                argv(),
-                input=prompt(bars),
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                env=env(),
-                timeout=TIMEOUT_S,
-                check=False,
-            )
+            proc.communicate(timeout=REAP_S)
         except subprocess.TimeoutExpired:
-            return _review(f"timeout after {TIMEOUT_S}s", CALL_CAP_USD)
-    return parse(proc.stdout, proc.returncode)
+            proc.kill()
+        return "", -signal.SIGKILL, True
+    return stdout, proc.returncode, False
+
+
+def decide(bars: Bars, position_qty: int = 0) -> DeskResult:
+    with tempfile.TemporaryDirectory(prefix="traderbot-desk-") as cwd:
+        stdout, code, timed_out = _run_claude(
+            argv(), prompt(bars, position_qty), cwd, env(), TIMEOUT_S
+        )
+    if timed_out:
+        return _review(f"timeout after {TIMEOUT_S}s", CALL_CAP_USD)
+    return parse(stdout, code)

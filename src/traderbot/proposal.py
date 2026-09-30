@@ -9,12 +9,12 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SIDES = ("buy", "hold", "review")  # buy and hold come from the desk; review from code
+SIDES = ("buy", "sell", "hold", "review")  # buy, sell and hold come from the desk; review from code
 TICK = Decimal("0.01")  # at $1 and above
 SUB_DOLLAR_TICK = Decimal("0.0001")
 
@@ -25,7 +25,7 @@ class DeskChoice(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     symbol: str = Field(max_length=10)
-    side: Literal["buy", "hold"]
+    side: Literal["buy", "sell", "hold"]
     rationale: str = Field(max_length=1000)
     confidence: float = Field(ge=0, le=1)
 
@@ -47,6 +47,7 @@ class Proposal:
     desk: str
     model: str
     created_at: datetime
+    expires_at: datetime | None  # the next session close; None only on cards before Phase 2
 
 
 def floor_to_tick(price: Decimal) -> Decimal:
@@ -54,8 +55,30 @@ def floor_to_tick(price: Decimal) -> Decimal:
     return (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
 
-def size(last_close: Decimal, max_notional: Decimal, band: Decimal) -> tuple[Decimal, int]:
-    """(limit, qty): limit = floor_to_tick(last_close * (1 + band)), qty = floor(max / limit)."""
+def ceil_to_tick(price: Decimal) -> Decimal:
+    tick = TICK if price >= 1 else SUB_DOLLAR_TICK
+    return (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+
+
+def size(
+    last_close: Decimal,
+    max_notional: Decimal,
+    band: Decimal,
+    side: str = "buy",
+    position_qty: int = 0,
+) -> tuple[Decimal, int]:
+    """(limit, qty) in code, never from the model.
+
+    Buy, and hold or review as a counterfactual buy: limit = floor_to_tick(last_close * (1 + band)),
+    qty = floor(max / limit). Sell: limit = ceil_to_tick(last_close * (1 - band)), qty = the smaller
+    of the position and floor(max / limit), so a sell never goes short.
+    """
+    if side == "sell":
+        limit = ceil_to_tick(last_close * (1 - band))
+        if limit <= 0:
+            return limit, 0
+        most = int((max_notional / limit).to_integral_value(rounding=ROUND_FLOOR))
+        return limit, max(0, min(position_qty, most))
     limit = floor_to_tick(last_close * (1 + band))
     if limit <= 0:
         return limit, 0
@@ -101,4 +124,9 @@ def from_json(text: str) -> Proposal:
         desk=raw["desk"],
         model=raw["model"],
         created_at=datetime.fromisoformat(raw["created_at"]),
+        expires_at=_moment(raw.get("expires_at")),
     )
+
+
+def _moment(raw: str | None) -> datetime | None:
+    return None if raw is None else datetime.fromisoformat(raw)
