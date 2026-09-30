@@ -16,7 +16,7 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 - [x] Fourteen reason codes, each with a deny and an allow test; `/dev/tty` approval; reject; card expiry; first decision wins; kill switch; spend reservations; append only, redacted events; sell side; breaker latch; `--json` on every command (`47f3fef`, `90b7135`).
 - [x] `scripts/check.sh` all zeros; `scripts/mutate.py` 26 of 26 rows red (`0a935fe`).
 - [x] Negative controls: the deny rule stops the agent's `uv run traderbot approve`; the offline TTY test fails closed with Errno 6 and no decision.
-- [ ] Positive control: Aditya runs `uv run traderbot approve` in Terminal.app, types the control card's prefix, and a paper order appears.
+- [x] Positive control: Aditya ran `uv run traderbot approve` in Terminal.app, typed `5894fe66`, and paper order `f6c889d0` came back `accepted` (read back from Alpaca: SPY buy 1 limit 768.02 day).
 
 ## Phase 3: data
 - [ ] Calendar staleness, adjusted history, cache with retry, EDGAR point in time facts; a script proves `filed <= as_of` on a live fetch.
