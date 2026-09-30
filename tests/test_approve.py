@@ -8,7 +8,7 @@ power and equity, no position, no open orders, the clock at 18:00 ET on 2026-09-
 import sqlite3
 import uuid
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -331,3 +331,58 @@ def test_a_control_card_is_labelled_so_scoring_can_leave_it_out(
     card = cli.propose("SPY", decide=desk_says("buy"), desk_label="control")
     assert card.proposal.desk == "control"
     assert cli.propose("SPY", decide=desk_says("hold")).proposal.desk == "single"
+
+
+def test_approve_after_a_submit_that_never_arrived_submits_again_once(
+    conn: sqlite3.Connection, live_stubs: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = store(conn, a_card(), gate.Allow())
+
+    def unreachable(trading: object, card: prop.Proposal, client_order_id: str) -> Any:
+        raise ConnectionError("Failed to establish a new connection")
+
+    monkeypatch.setattr(broker, "submit_limit_order", unreachable)
+    with pytest.raises(ConnectionError):
+        cli.approve(key[:8])
+    assert ledger.claim_state(conn, key, NOW) == "unconfirmed"
+    assert decisions(conn) == []
+    order = placed_order(key)
+    submitted = recording_submit(monkeypatch, order)
+    assert cli.approve(key[:8]) is order
+    assert [cid for _, cid in submitted] == [key]
+    assert (ledger.find(conn, key).order_id, decisions(conn)) == (str(order.id), [(key, "approve")])
+
+
+def test_a_stale_submitting_claim_is_taken_over(
+    conn: sqlite3.Connection, live_stubs: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = store(conn, a_card(), gate.Allow())
+    ledger.claim_order(conn, key, 3, NOW - timedelta(seconds=ledger.CLAIM_TTL_S + 1))
+    assert ledger.claim_state(conn, key, NOW) == "unconfirmed"
+    order = placed_order(key)
+    recording_submit(monkeypatch, order)
+    assert cli.approve(key[:8]) is order
+    assert ledger.orders_today(conn, NOW.date()) == 1
+
+
+def test_a_fresh_claim_blocks_a_second_approve_and_a_reject(
+    conn: sqlite3.Connection, live_stubs: None
+) -> None:
+    key = store(conn, a_card(), gate.Allow())
+    ledger.claim_order(conn, key, 3, NOW)
+    with pytest.raises(cli.Refused, match="being submitted"):
+        cli.approve(key[:8])
+    with pytest.raises(cli.Refused, match="being submitted"):
+        cli.reject(key[:8])
+
+
+def test_rejecting_an_unconfirmed_claim_frees_its_order_slot(
+    conn: sqlite3.Connection, live_stubs: None
+) -> None:
+    key = store(conn, a_card(), gate.Allow())
+    ledger.claim_order(conn, key, 3, NOW)
+    ledger.unconfirm_claim(conn, key, NOW)
+    assert ledger.orders_today(conn, NOW.date()) == 1
+    assert cli.reject(key[:8]) == "reject"  # Alpaca has no order under the digest
+    assert ledger.claim_state(conn, key, NOW) is None
+    assert ledger.orders_today(conn, NOW.date()) == 0

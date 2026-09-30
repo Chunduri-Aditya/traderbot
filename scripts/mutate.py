@@ -112,6 +112,12 @@ ROWS: list[tuple[str, str, str, str]] = [
         "test_sell_exceeds_position_allow_selling_the_whole_position",
     ),
     (
+        "boundary: a non finite limit sizes nothing",
+        "sizable = limit.is_finite() and limit > 0 and proposal.qty > 0",
+        "sizable = limit > 0 and proposal.qty > 0",
+        "test_qty_zero_deny_on_a_non_finite_limit",
+    ),
+    (
         "scope: buying power binds a sell",
         "if buying and notional > snapshot.buying_power:",
         "if notional > snapshot.buying_power:",

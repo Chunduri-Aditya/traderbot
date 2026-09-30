@@ -217,3 +217,10 @@ def test_position_cap_does_not_block_a_sell() -> None:
     sell = a_card(side="sell", limit_price=Decimal("760.38"))
     held = a_snapshot(position_qty=30, position_value=Decimal("22926.00"))
     assert gate.check(sell, "SPY", held, LIMITS, NOW).allowed
+
+
+def test_qty_zero_deny_on_a_non_finite_limit() -> None:
+    for limit in ("NaN", "Infinity"):
+        card = a_card(qty=1, limit_price=Decimal(limit))
+        result = gate.check(card, "SPY", a_snapshot(), LIMITS, NOW)
+        assert reasons(result) == ("QTY_ZERO",), limit

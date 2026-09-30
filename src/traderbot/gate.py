@@ -90,7 +90,10 @@ def check(
 ) -> GateResult:
     """Every rule runs; a deny lists each code that applies. Buys and sells are the only sides."""
     reasons: list[str] = []
-    notional = proposal.qty * proposal.limit_price
+    limit = proposal.limit_price
+    # A non finite limit (a NaN or infinite close upstream) sizes nothing: QTY_ZERO, never a crash.
+    sizable = limit.is_finite() and limit > 0 and proposal.qty > 0
+    notional = proposal.qty * limit if sizable else Decimal(0)
     buying = proposal.side == "buy"
     if proposal.symbol != cli_symbol:
         reasons.append("SYMBOL_MISMATCH")
@@ -98,7 +101,7 @@ def check(
         reasons.append("SIDE_NOT_ALLOWED")
     if proposal.bar_date != snapshot.expected_as_of or proposal.as_of != snapshot.expected_as_of:
         reasons.append("STALE_BARS")
-    if proposal.qty <= 0 or proposal.limit_price <= 0:
+    if not sizable:
         reasons.append("QTY_ZERO")
     if notional > limits.max_notional:
         reasons.append("NOTIONAL_OVER_MAX")

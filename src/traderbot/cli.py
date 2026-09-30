@@ -18,6 +18,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, TextIO
 
 from alpaca.trading.client import TradingClient
@@ -31,8 +32,24 @@ PREFIX_LEN = 8
 TYPED_PREFIX_RE = re.compile(r"[0-9a-f]{8}")
 TTY = "/dev/tty"
 LIMITS = gate.Limits()
-# Hangul fillers render as blank space but are letters, so isprintable() passes them.
-FILLERS = frozenset({"\u115f", "\u1160", "\u3164", "\uffa0"})
+# Default ignorable code points that isprintable() passes (letters and marks that render as
+# nothing): the combining grapheme joiner, Hangul fillers, Khmer inherent vowels, Mongolian free
+# variation selectors and variation selectors 1 to 256. The format ones (Cf) are escaped already.
+INVISIBLE = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xE0100, 0xE01EF),
+)
+
+
+def _invisible(ch: str) -> bool:
+    point = ord(ch)
+    return any(low <= point <= high for low, high in INVISIBLE)
 
 
 class Refused(Exception):
@@ -43,7 +60,7 @@ def shown(text: str) -> str:
     """Model or user text for the terminal: line breaks, control, format and invisible characters
     print as escapes, so text can neither drive the terminal nor forge a line of output."""
     return "".join(
-        ch if ch.isprintable() and ch not in FILLERS else ch.encode("unicode_escape").decode()
+        ch if ch.isprintable() and not _invisible(ch) else ch.encode("unicode_escape").decode()
         for ch in text
     )
 
@@ -128,6 +145,8 @@ def propose(
             f" {bars.as_of}; no desk call made"
         )
     snapshot = _snapshot(trading, conn, now, symbol, bars.as_of)
+    if snapshot.kill_switch:
+        raise Refused("the kill switch is on (`traderbot on` clears it); no desk call made")
     if _tripped(conn, snapshot, limits, now):
         raise Refused("the circuit breaker is tripped (`traderbot reset-breaker`); no desk call")
     window = data.sessions(trading, now.date(), now.date() + timedelta(days=10))
@@ -161,7 +180,13 @@ def propose(
         created_at=now,
         expires_at=expires_at,
     )
-    settled = replace(snapshot, day_spend_usd=ledger.day_spend(conn, now.date(), now))
+    # The desk can take minutes: read spend, the switch and the latch again before the verdict.
+    settled = replace(
+        snapshot,
+        day_spend_usd=ledger.day_spend(conn, now.date(), now),
+        kill_switch=ledger.kill_switch_on(),
+        breaker_latched=ledger.breaker_latched(conn),
+    )
     verdict = gate.check(card, card.requested_symbol, settled, limits, now)
     key = ledger.insert_card(conn, card, result.cost_usd, result.model_usage, verdict)
     stored = ledger.find(conn, key)
@@ -170,7 +195,14 @@ def propose(
 
 
 def approve(prefix: str, limits: gate.Limits = LIMITS) -> Order:
-    """The in process approve: the CLI reaches it only through `approve_at_terminal`."""
+    """The in process approve: the CLI reaches it only through `approve_at_terminal`.
+
+    The decision is recorded only once an order exists. Before submitting, approve claims the
+    card's order slot in one transaction (one claim per card, the daily cap counted with claims
+    in flight), then reads the clock once more; broker refuses while the kill switch is on. A
+    refusal after the claim frees it; a submit that raises keeps it as unconfirmed, and the next approve, reject or
+    status looks the order up by client id.
+    """
     conn = ledger.connect()
     card = _find(conn, prefix)
     short = card.digest[:PREFIX_LEN]
@@ -184,8 +216,8 @@ def approve(prefix: str, limits: gate.Limits = LIMITS) -> Order:
     now = data.now_et()
     existing = broker.order_by_client_id(trading, card.digest)
     if existing is not None:
-        _decide(conn, card.digest, now)
         ledger.record_order(conn, card.digest, str(existing.id), existing.status.value, now)
+        _decide(conn, card.digest, now)
         ledger.log_event(conn, "order", now, card.digest, {"order_id": str(existing.id)})
         return existing
     window = data.sessions(trading, now.date() - timedelta(days=10), now.date())
@@ -196,9 +228,26 @@ def approve(prefix: str, limits: gate.Limits = LIMITS) -> Order:
     if isinstance(verdict, gate.Deny):
         ledger.log_event(conn, "refused", now, card.digest, {"reasons": list(verdict.reasons)})
         raise Refused(f"gate denies card {short} now: {', '.join(verdict.reasons)}")
-    _decide(conn, card.digest, now)
-    placed = broker.submit_limit_order(trading, card.proposal, card.digest)
+    try:
+        ledger.claim_order(conn, card.digest, limits.daily_order_cap, now)
+    except ledger.ClaimRefused as err:
+        raise Refused(f"card {short} {err}") from err
+    last_look = data.now_et()  # the reads above take several round trips; broker checks OFF
+    expires_at = card.proposal.expires_at
+    if expires_at is None or last_look >= expires_at:
+        ledger.release_claim(conn, card.digest)
+        ledger.log_event(conn, "refused", last_look, card.digest, {"reasons": ["CARD_EXPIRED"]})
+        raise Refused(f"gate denies card {short} now: CARD_EXPIRED")
+    try:
+        placed = broker.submit_limit_order(trading, card.proposal, card.digest)
+    except broker.KillSwitchOn as err:
+        ledger.release_claim(conn, card.digest)
+        raise Refused(f"gate denies card {short} now: KILL_SWITCH ({err})") from err
+    except BaseException:
+        ledger.unconfirm_claim(conn, card.digest, data.now_et())
+        raise
     ledger.record_order(conn, card.digest, str(placed.id), placed.status.value, now)
+    _decide(conn, card.digest, now)
     ledger.log_event(conn, "order", now, card.digest, {"order_id": str(placed.id)})
     return placed
 
@@ -211,13 +260,29 @@ def _decide(conn: sqlite3.Connection, key: str, now: datetime) -> None:
 
 
 def reject(prefix: str) -> str:
-    """Record a no for the card; the first decision stands."""
+    """Record a no for the card; the first decision stands.
+
+    Offline unless an approve's submit failed or died: then Alpaca is asked first, and an order
+    that did reach it is recorded instead of rejected.
+    """
     conn = ledger.connect()
     card = _find(conn, prefix)
+    short = card.digest[:PREFIX_LEN]
     now = data.now_et()
+    state = ledger.claim_state(conn, card.digest, now)
+    if state == "in_flight":
+        raise Refused(f"card {short} is being submitted by an approve; run reject again")
+    if state == "unconfirmed":
+        trading = broker.client(keychain.load())
+        found = broker.order_by_client_id(trading, card.digest)
+        if found is not None:
+            ledger.record_order(conn, card.digest, str(found.id), found.status.value, now)
+            _decide(conn, card.digest, now)
+            raise Refused(f"card {short} already reached Alpaca as order {found.id}")
+        ledger.release_claim(conn, card.digest)
     standing = ledger.record_decision(conn, card.digest, "reject", now)
     if standing != "reject":
-        raise Refused(f"card {card.digest[:PREFIX_LEN]} already decided: {standing}")
+        raise Refused(f"card {short} already decided: {standing}")
     ledger.log_event(conn, "decision", now, card.digest, {"decision": "reject"})
     return standing
 
@@ -252,7 +317,7 @@ def approve_at_terminal(limits: gate.Limits = LIMITS) -> Order:
             for card in ledger.recent(conn, 50)
             if card.allowed
             and card.decision is None
-            and card.order_id is None
+            and not card.order_id
             and card.proposal.expires_at is not None
             and now < card.proposal.expires_at
         ]
@@ -341,7 +406,10 @@ def card_view(card: ledger.Card) -> dict[str, Any]:
 def _line(card: ledger.Card) -> str:
     p = card.proposal
     verdict = "ALLOW" if card.allowed else "DENY " + ",".join(card.reasons)
-    order = f"order {card.order_id} {card.order_status}" if card.order_id else "no order"
+    if card.order_id:
+        order = f"order {card.order_id} {card.order_status}"
+    else:
+        order = f"order {card.order_status}" if card.order_status else "no order"
     decided = f"  {card.decision}" if card.decision else ""
     return (
         f"{card.digest[:PREFIX_LEN]}  {p.created_at:%Y-%m-%d %H:%M}  {shown(p.symbol)} {p.side} "
@@ -375,7 +443,7 @@ def _readable(command: str, view: dict[str, Any]) -> list[str]:
         return [f"circuit breaker trips cleared: {view['reset']}"]
     header = (
         f"traderbot status  cards {len(view['cards'])}  spend {view['day']}"
-        f" ${float(view['spend_usd']):.4f} of ${view['cap_usd']}"
+        f" ${Decimal(view['spend_usd']).quantize(Decimal('0.0001'))} of ${view['cap_usd']}"
         f"  kill switch {'ON' if view['kill_switch'] else 'off'}"
         f"  breaker {'TRIPPED' if view['breaker_latched'] else 'ok'}"
     )

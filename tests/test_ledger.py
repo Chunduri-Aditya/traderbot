@@ -186,3 +186,16 @@ def test_kill_switch_file(conn: sqlite3.Connection) -> None:
     assert (ledger.home() / "OFF").exists()
     ledger.set_kill_switch(False)
     assert not ledger.kill_switch_on()
+
+
+def test_an_order_claim_counts_against_the_daily_cap(conn: sqlite3.Connection) -> None:
+    keys = [
+        ledger.insert_card(conn, a_card(rationale=f"card {i}"), Decimal(0), (), gate.Allow())
+        for i in range(4)
+    ]
+    ledger.record_order(conn, keys[0], "order-0", "filled", NOW)
+    ledger.claim_order(conn, keys[1], 3, NOW)  # an approve in flight holds the second slot
+    ledger.claim_order(conn, keys[2], 3, NOW)  # the third slot is still free
+    with pytest.raises(ledger.ClaimRefused, match="DAILY_ORDER_CAP"):
+        ledger.claim_order(conn, keys[3], 3, NOW)  # both gates may have read 2 before either claim
+    assert ledger.orders_today(conn, NOW.date()) == 3

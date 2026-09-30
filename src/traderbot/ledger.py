@@ -27,6 +27,7 @@ DEFAULT_HOME = "~/.traderbot"
 KILL_SWITCH_FILE = "OFF"
 PREFIX_RE = re.compile(r"[0-9a-f]{8,64}")
 RESERVATION_TIMEOUT_S = 600  # twice the desk's 300 s call timeout
+CLAIM_TTL_S = 120  # an order claim older than this is a crashed approve, not one in flight
 DECISIONS = ("approve", "reject")
 
 SCHEMA = """
@@ -90,6 +91,9 @@ CREATE TABLE IF NOT EXISTS breaker (
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_replace BEFORE INSERT ON events
+WHEN NEW.seq IN (SELECT seq FROM events)
 BEGIN SELECT RAISE(ABORT, 'events are append only'); END;
 """
 
@@ -239,6 +243,79 @@ def record_order(
         )
 
 
+class ClaimRefused(Exception):
+    """The card's order slot is not free: rejected, placed, in flight, or the day is full."""
+
+
+def claim_order(conn: sqlite3.Connection, key: str, cap: int, now: datetime) -> None:
+    """Take the card's order slot before submitting, in one write transaction.
+
+    A claim is an `orders` row with an empty order id. It is refused when the card was rejected,
+    when an order was placed, when another approve's claim is younger than CLAIM_TTL_S, or when
+    the day's orders, claims included, already reach `cap`. An unconfirmed or stale claim (a
+    submit that failed or a process that died) is taken over, keeping its place in the count.
+    """
+    with _immediate(conn):
+        decided = conn.execute("SELECT decision FROM decisions WHERE digest = ?", (key,))
+        row = decided.fetchone()
+        if row is not None and row[0] == "reject":
+            raise ClaimRefused("was rejected")
+        held = conn.execute(
+            "SELECT order_id, status, updated_at FROM orders WHERE digest = ?", (key,)
+        ).fetchone()
+        if held is not None:
+            order_id, status, updated_at = held
+            if order_id:
+                raise ClaimRefused(f"already has order {order_id}")
+            age = (now - datetime.fromisoformat(updated_at)).total_seconds()
+            if status == "submitting" and age <= CLAIM_TTL_S:
+                raise ClaimRefused("is being submitted by another approve; run approve again")
+            conn.execute(
+                "UPDATE orders SET status = 'submitting', updated_at = ? WHERE digest = ?",
+                (now.isoformat(), key),
+            )
+            return
+        (count,) = conn.execute(
+            "SELECT count(*) FROM orders WHERE submitted_day = ?", (now.date().isoformat(),)
+        ).fetchone()
+        if count >= cap:
+            raise ClaimRefused("gate denies it now: DAILY_ORDER_CAP")
+        conn.execute(
+            "INSERT INTO orders VALUES (?, '', 'submitting', ?, ?, NULL, NULL)",
+            (key, now.date().isoformat(), now.isoformat()),
+        )
+
+
+def unconfirm_claim(conn: sqlite3.Connection, key: str, now: datetime) -> None:
+    """The submit raised: the order may or may not have reached Alpaca. Keep the slot."""
+    with conn:
+        conn.execute(
+            "UPDATE orders SET status = 'unconfirmed', updated_at = ?"
+            " WHERE digest = ? AND order_id = ''",
+            (now.isoformat(), key),
+        )
+
+
+def release_claim(conn: sqlite3.Connection, key: str) -> None:
+    """Nothing was sent: free the slot."""
+    with conn:
+        conn.execute("DELETE FROM orders WHERE digest = ? AND order_id = ''", (key,))
+
+
+def claim_state(conn: sqlite3.Connection, key: str, now: datetime) -> str | None:
+    """The claim's state: in_flight, unconfirmed (failed or stale), placed, or None."""
+    held = conn.execute(
+        "SELECT order_id, status, updated_at FROM orders WHERE digest = ?", (key,)
+    ).fetchone()
+    if held is None:
+        return None
+    order_id, status, updated_at = held
+    if order_id:
+        return "placed"
+    age = (now - datetime.fromisoformat(updated_at)).total_seconds()
+    return "in_flight" if status == "submitting" and age <= CLAIM_TTL_S else "unconfirmed"
+
+
 def orders_today(conn: sqlite3.Connection, day: date) -> int:
     (count,) = conn.execute(
         "SELECT count(*) FROM orders WHERE submitted_day = ?", (day.isoformat(),)
@@ -369,7 +446,7 @@ SECRET_WORDS = frozenset(
 
 def _names_a_secret(key: str) -> bool:
     words = re.split(r"[_\-\s]+", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).lower())
-    return any(word in SECRET_WORDS for word in words)
+    return any(word in SECRET_WORDS or word.removesuffix("s") in SECRET_WORDS for word in words)
 
 
 def redact(value: Any) -> Any:
@@ -400,17 +477,28 @@ def log_event(
 
 
 def mark_equity(conn: sqlite3.Connection, equity: Decimal, now: datetime) -> Decimal:
-    """Record this equity reading and return the peak across every reading, this one included."""
+    """Record this equity reading; return the peak since the last breaker reset, this one included."""
     with conn:
         conn.execute("INSERT INTO equity_marks VALUES (?, ?)", (now.isoformat(), str(equity)))
-    rows = conn.execute("SELECT equity FROM equity_marks").fetchall()
-    return max(Decimal(value) for (value,) in rows)
+    since = _last_reset(conn)
+    rows = conn.execute("SELECT at, equity FROM equity_marks").fetchall()
+    kept = [Decimal(v) for at, v in rows if since is None or datetime.fromisoformat(at) >= since]
+    return max([*kept, equity])
+
+
+def _last_reset(conn: sqlite3.Connection) -> datetime | None:
+    """A breaker reset re-bases it: the peak and the loss streak count only from then on."""
+    rows = conn.execute("SELECT reset_at FROM breaker WHERE reset_at IS NOT NULL").fetchall()
+    return max((datetime.fromisoformat(at) for (at,) in rows), default=None)
 
 
 def consecutive_losses(conn: sqlite3.Connection) -> int:
     """Latest settled fills with a negative raw return, in a row (Phase 4 writes settlements)."""
+    since = _last_reset(conn)
     rows = conn.execute("SELECT settled_at, raw_return FROM settlements WHERE kind = 'fill'")
-    newest_first = sorted(rows.fetchall(), key=lambda r: datetime.fromisoformat(r[0]), reverse=True)
+    stamped = [(datetime.fromisoformat(at), ret) for at, ret in rows.fetchall()]
+    after = [(at, ret) for at, ret in stamped if since is None or at > since]
+    newest_first = sorted(after, key=lambda row: row[0], reverse=True)
     streak = 0
     for _, raw_return in newest_first:
         if Decimal(raw_return) >= 0:

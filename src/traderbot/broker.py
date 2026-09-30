@@ -91,7 +91,10 @@ def position(trading: TradingClient, symbol: str) -> tuple[int, Decimal]:
     qty = Decimal(held.qty)
     if qty < 0 or qty != qty.to_integral_value():
         raise RuntimeError(f"{symbol} position of {qty} shares is short or fractional")
-    return int(qty), Decimal(held.market_value or 0)
+    if held.market_value is None:
+        # Valuing it at $0 would let POSITION_OVER_MAX_PCT pass on a position of unknown size.
+        raise RuntimeError(f"{symbol} position of {qty} shares came back without a market value")
+    return int(qty), Decimal(held.market_value)
 
 
 SIDES = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}

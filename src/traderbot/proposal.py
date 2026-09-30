@@ -99,7 +99,9 @@ def canonical(proposal: Proposal) -> str:
 
 
 def digest_of(text: str) -> str:
-    return hashlib.sha256(text.encode("ascii")).hexdigest()
+    """sha256 of the text as UTF-8: canonical JSON is ASCII, so a stored card hashes the same,
+    and an edit that adds any other character reads as a mismatch instead of a crash."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def digest(proposal: Proposal) -> str:
