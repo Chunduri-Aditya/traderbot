@@ -4,8 +4,10 @@ commands and reject."""
 import io
 import json
 import os
+import select
 import subprocess
 import sys
+import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -35,6 +37,62 @@ def test_approve_without_a_terminal_fails_closed_with_no_decision(tmp_path: Path
     assert "Errno 6" in proc.stderr and "/dev/tty" in proc.stderr
     assert conn.execute("SELECT count(*) FROM decisions").fetchone() == (0,)
     assert conn.execute("SELECT count(*) FROM orders").fetchone() == (0,)
+
+
+def test_approve_prompt_reads_a_prefix_typed_at_a_real_terminal(tmp_path: Path) -> None:
+    # The child is a session leader whose controlling terminal is a pty slave, as in Terminal.app;
+    # it opens /dev/tty the way approve does, prompts, and reads what this test types at the master.
+    child = (
+        "import fcntl, sys, termios\n"
+        "fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+        "from traderbot import cli\n"
+        "with cli.open_tty() as tty:\n"
+        "    typed = cli.read_prefix(tty, tty)\n"
+        "sys.stdout.write(f'\\ntyped={typed}\\n')\n"
+    )
+    master, slave = os.openpty()
+    env = {"PATH": os.environ["PATH"], ledger.HOME_ENV: str(tmp_path)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        start_new_session=True,
+        env=env,
+    )
+    os.close(slave)
+    seen = b""
+    typed = False
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.2)
+        if ready:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:  # Linux reports the closed slave as EIO, macOS as EOF
+                break
+            if not chunk:
+                break
+            seen += chunk
+        if not typed and b"prefix" in seen:
+            os.write(master, b"3f9a1c2e\n")
+            typed = True
+        elif not ready and proc.poll() is not None:
+            break
+    os.close(master)
+    out = seen.decode(errors="replace").replace("\r\n", "\n")
+    assert proc.wait(timeout=10) == 0, out
+    assert "character prefix of the card to approve" in out
+    assert "\ntyped=3f9a1c2e\n" in out
+
+
+def test_open_tty_reports_only_a_missing_terminal_as_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only ENXIO means no controlling terminal; any other OSError keeps its own traceback.
+    monkeypatch.setattr(cli, "TTY", str(tmp_path / "no-such-tty"))
+    with pytest.raises(FileNotFoundError):
+        cli.open_tty()
 
 
 def test_approve_takes_no_argument() -> None:

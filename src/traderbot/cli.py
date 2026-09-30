@@ -8,7 +8,9 @@ live, records the first decision and submits. Every command takes --json.
 """
 
 import argparse
+import errno
 import hmac
+import io
 import json
 import re
 import sqlite3
@@ -222,9 +224,12 @@ def reject(prefix: str) -> str:
 
 def open_tty() -> TextIO:
     try:
-        return open(TTY, "r+", encoding="utf-8")
+        raw = io.FileIO(TTY, "r+")  # unbuffered: a terminal is not seekable, so no BufferedRandom
     except OSError as err:
+        if err.errno != errno.ENXIO:
+            raise
         raise Refused(f"approval is typed at {TTY} and this process has none ({err})") from err
+    return io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
 
 
 def read_prefix(tty_in: TextIO, tty_out: TextIO) -> str:
