@@ -3,8 +3,8 @@
 _How it is built. Committed. Update in the same commit as any change to the flow, layout, or stack._
 
 ## Flow
-- propose: `keychain` keys, then `data` (calendar sets `as_of`, SIP daily bars), then `desk` (one clean claude call, schema only), then `proposal` (code sizes qty and limit, sha256 digest), then `gate` (pure verdict), then `ledger` (card row).
-- approve: `ledger` card, sha256 of the stored text checked against its key, then `broker` lookup by client id (return it if found), else `gate` rerun on live account state against the signed `requested_symbol`, then a DAY limit buy on the paper host.
+- propose: kill switch check, `keychain` keys, `data` (calendar sets `as_of`, SIP daily bars; stale refuses), account snapshot (a tripped breaker refuses), a spend reservation of the $0.25 call cap, `desk` (one clean claude call in its own process group, schema only), the cost settled, `proposal` (code sizes qty and limit, buy or sell, sha256 digest, expiry at the next session close), `gate` (pure verdict), `ledger` (card row and an event).
+- approve: the prefix is typed at `/dev/tty` (no terminal, no approval), then the `ledger` card, sha256 of the stored text checked against its key, a card denied at propose or rejected refused, `broker` lookup by client id (return it if found), else `gate` rerun on live account state against the signed `requested_symbol`, the first decision recorded (sqlite primary key), then a DAY limit order on the paper host unless the kill switch file exists.
 
 ## Stack
 - Python 3.13 (`>=3.12`), uv with `uv_build`: Aditya's default stack.
@@ -14,15 +14,17 @@ _How it is built. Committed. Update in the same commit as any change to the flow
 
 ## Layout
 - `src/traderbot/cli.py`: argparse commands and their readable output.
-- `src/traderbot/gate.py`: the only place a rule lives; `Limits` holds Aditya's numbers until Phase 3.
+- `src/traderbot/gate.py`: the only place a rule lives (fourteen reason codes); `Limits` holds Aditya's numbers until Phase 3.
+- `src/traderbot/ledger.py`: cards, orders, decisions, spend reservations, append only events, equity marks, settlements (written from Phase 4), the breaker latch, and the `OFF` kill switch file.
+- `scripts/check.sh`: ruff, ruff format, mypy strict and pytest, one labeled exit code each; `scripts/mutate.py`: breaks each gate rule and requires its named test to fail.
 - `src/traderbot/broker.py`: every trading client passes the paper host check here.
 - `src/traderbot/{cache,fence,scoring,backtest,fundamentals,live_gate}.py`: loud stubs until their phase.
-- `tests/test_smoke.py`: the live path in two halves, the real desk and a code built buy through approve (marked `live`, deselected by default); `tests/test_broker.py`: the paper host check.
+- `tests/test_smoke.py`: the live path in two halves, the real desk and a code built buy through approve (marked `live`, deselected by default). `tests/conftest.py` makes claude, the Keychain and every HTTP request tripwires in offline tests and points `TRADERBOT_HOME` at `tmp_path`.
 
 ## Boundaries
 - Alpaca paper trading (`paper-api.alpaca.markets`) and market data (`data.alpaca.markets`); keys from the Keychain item `traderbot-alpaca-paper`, never in env, files or logs.
 - The desk's output is untrusted: it reaches the order only as schema fields, and code sets qty and price; the gate rechecks everything before any submit.
-- Approval is Aditya's: project deny rules keep the agent off `approve` (Phase 2 adds the `/dev/tty` read).
+- Approval is Aditya's: `approve` and `reset-breaker` read from `/dev/tty`, which an agent shell does not have (Errno 6), and project deny rules keep the agent off `approve` and both Keychain read paths. A human who runs code as Aditya can bypass anything in process.
 
 ## Provenance
 Ideas rebuilt in original code; nothing is pasted from `repos/` (OpenBB `develop` is AGPL 3.0).
@@ -33,3 +35,9 @@ Ideas rebuilt in original code; nothing is pasted from `repos/` (OpenBB `develop
 | `live` pytest marker deselected by default | `/Users/chunduri/Desktop/twin/pyproject.toml` | Aditya's own | 1 |
 | Unparseable model output becomes REVIEW, never a default hold | tradingagents `agents/rating.py:27-31,49-88` (`audits/tradingagents.md:71`) | Apache 2.0 | 1 |
 | Every price carries `as_of`, and the order path refuses stale data | osiris `src/app/api/markets/route.ts:177` and tradingview-mcp `quote_stale` (`audits/COMPARISON.md`, pattern 1) | MIT | 1 |
+| Reserve spend before a call; a dead reservation or a missing cost is charged in full | `/Users/chunduri/Desktop/twin/src/twin/spend.py:46-101` (rebuilt on a sqlite transaction) | Aditya's own | 2 |
+| Typed digest prefix, compared in constant time | `/Users/chunduri/Desktop/twin/src/twin/approval.py:33,165-168` (the TTY read is new) | Aditya's own | 2 |
+| Escape every character that can drive a terminal or render as nothing, Hangul fillers included | `/Users/chunduri/Desktop/twin/src/twin/render.py:17-28` | Aditya's own | 2 |
+| Offline tests make paid calls tripwires | `/Users/chunduri/Desktop/twin/tests/conftest.py:186-190` | Aditya's own | 2 |
+| Redact logged details by key name at any depth | paperclip `server/src/redaction.ts:881`, `server/src/services/activity-log.ts:75-87` | MIT | 2 |
+| Circuit breaker on consecutive losses, halting on an invalid starting value | ECC `skills/llm-trading-agent-security/SKILL.md:92-110` (its regex injection denylist is not adopted) | MIT | 2 |
