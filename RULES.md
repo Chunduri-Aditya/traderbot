@@ -7,7 +7,7 @@ _Conventions for code in this repo. Imported by `CLAUDE.md`, so it loads every s
 
 ## Do
 - Money is `Decimal` end to end; convert to float only at the `alpaca-py` request boundary.
-- Every "now" is `datetime.now(ZoneInfo("America/New_York"))`, taken once per command and passed down.
+- Every "now" is `datetime.now(ZoneInfo("America/New_York"))`, taken once per command and passed down; the one exception is approve, which reads the clock again right before the submit.
 - A new rule is a named reason code in `gate.py` with a deny and an allow test whose input crosses the limit, and a row in `scripts/mutate.py` naming that deny test.
 - A card built by code, not the desk, carries a `desk_label` other than `single`.
 - Every trading client goes through `broker.assert_paper`; the check raises, never a bare `assert`.
