@@ -9,7 +9,8 @@ _Conventions for code in this repo. Imported by `CLAUDE.md`, so it loads every s
 - Money is `Decimal` end to end; convert to float only at the `alpaca-py` request boundary.
 - Every "now" is `datetime.now(ZoneInfo("America/New_York"))`, taken once per command and passed down; the one exception is approve, which reads the clock again right before the submit.
 - A new rule is a named reason code in `gate.py` with a deny and an allow test whose input crosses the limit, and a row in `scripts/mutate.py` naming that deny test.
-- A card built by code, not the desk, carries a `desk_label` other than `single`.
+- A card built by code, not the desk, carries a `desk_label` other than the model desks' `single` (Phases 1 and 2) and `full` (the seven role desk, Phase 5 on).
+- Untrusted text (EDGAR, anything scraped) reaches a prompt only through `fence.wrap_untrusted` with the call's nonce.
 - Every trading client goes through `broker.assert_paper`; the check raises, never a bare `assert`.
 - Tests set `TRADERBOT_HOME` to `tmp_path`; nothing but the real CLI touches `~/.traderbot`.
 - A borrowed idea gets a Provenance row in `ARCHITECTURE.md` in the same commit.

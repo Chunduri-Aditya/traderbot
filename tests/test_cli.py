@@ -139,7 +139,7 @@ def test_status_json_lists_a_card(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["status", "--json"]) == 0
     (card,) = json.loads(capsys.readouterr().out)["cards"]
     assert (card["digest"], card["side"], card["limit_price"]) == (key, "buy", "768.02")
-    assert card["desk"] == "single"
+    assert card["desk"] == "single"  # a stored Phase 2 card keeps its label
 
 
 def test_off_and_on_toggle_the_kill_switch(capsys: pytest.CaptureFixture[str]) -> None:

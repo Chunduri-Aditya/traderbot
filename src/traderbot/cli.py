@@ -28,7 +28,7 @@ from alpaca.data.enums import Adjustment
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Order
 
-from traderbot import broker, data, desk, gate, keychain, ledger, scoring
+from traderbot import broker, data, desk, fundamentals, gate, keychain, ledger, scoring, text
 from traderbot import proposal as prop
 
 SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:\.[A-Z]{1,2})?")
@@ -36,37 +36,11 @@ PREFIX_LEN = 8
 TYPED_PREFIX_RE = re.compile(r"[0-9a-f]{8}")
 TTY = "/dev/tty"
 LIMITS = gate.Limits()
-# Default ignorable code points that isprintable() passes (letters and marks that render as
-# nothing): the combining grapheme joiner, Hangul fillers, Khmer inherent vowels, Mongolian free
-# variation selectors and variation selectors 1 to 256. The format ones (Cf) are escaped already.
-INVISIBLE = (
-    (0x034F, 0x034F),
-    (0x115F, 0x1160),
-    (0x17B4, 0x17B5),
-    (0x180B, 0x180F),
-    (0x3164, 0x3164),
-    (0xFE00, 0xFE0F),
-    (0xFFA0, 0xFFA0),
-    (0xE0100, 0xE01EF),
-)
-
-
-def _invisible(ch: str) -> bool:
-    point = ord(ch)
-    return any(low <= point <= high for low, high in INVISIBLE)
+shown = text.shown  # cli.shown: the one escape for model and user text
 
 
 class Refused(Exception):
     """A command that stops on purpose (spend cap, stale bars, tamper, gate deny). Exit code 1."""
-
-
-def shown(text: str) -> str:
-    """Model or user text for the terminal: line breaks, control, format and invisible characters
-    print as escapes, so text can neither drive the terminal nor forge a line of output."""
-    return "".join(
-        ch if ch.isprintable() and not _invisible(ch) else ch.encode("unicode_escape").decode()
-        for ch in text
-    )
 
 
 def _symbol(raw: str) -> str:
@@ -126,16 +100,23 @@ def _find(conn: sqlite3.Connection, prefix: str) -> ledger.Card:
         raise Refused(str(err)) from err
 
 
+DESK_LABEL = "full"  # the seven role desk; Phase 1 and 2 cards say "single"
+
+
 def propose(
     raw_symbol: str,
     limits: gate.Limits = LIMITS,
-    decide: Callable[[data.Bars, int], desk.DeskResult] = desk.decide,
-    desk_label: str = "single",
+    decide: Callable[[data.Bars, int, desk.DeskContext], desk.DeskResult] = desk.decide,
+    desk_label: str = DESK_LABEL,
+    cik: str | None = None,
 ) -> ledger.Card:
     """`decide` is the desk. A code built buy (the live order test, the Phase 2 positive
-    control) passes its own `decide` and a `desk_label` other than "single", which the card
-    carries under its digest so scoring can leave it out."""
+    control) passes its own `decide` and a `desk_label` other than the model desks' ("single",
+    "full"), which the card carries under its digest so scoring can leave it out. With `cik`,
+    the desk also sees the EDGAR facts filed by the card's as_of."""
     symbol = _symbol(raw_symbol)
+    if cik is not None and not fundamentals.CIK_RE.fullmatch(cik):
+        raise Refused(f"a CIK is 1 to 10 digits: {shown(cik)}")
     now = data.now_et()
     conn = ledger.connect()
     if ledger.kill_switch_on():
@@ -155,11 +136,13 @@ def propose(
         raise Refused("the circuit breaker is tripped (`traderbot reset-breaker`); no desk call")
     window = data.sessions(trading, now.date(), now.date() + timedelta(days=10))
     expires_at = data.next_close(window, now)
+    facts = None if cik is None else fundamentals.load_snapshot(symbol, cik, bars.as_of, now)
+    context = desk.DeskContext(fundamentals=facts, track_record=desk_report(conn))
     try:
         rid = ledger.reserve(conn, desk.CALL_CAP_USD, limits.day_spend_cap_usd, now)
     except ledger.SpendCapReached as err:
         raise Refused(f"{err}; no desk call made") from err
-    result = decide(bars, snapshot.position_qty)
+    result = decide(bars, snapshot.position_qty, context)
     ledger.settle(conn, rid, result.cost_usd, now)
     choice = result.choice
     side = choice.side if choice else "review"
@@ -583,7 +566,7 @@ def _readable(command: str, view: dict[str, Any]) -> list[str]:
 
 def _run(command: str, args: argparse.Namespace) -> dict[str, Any]:
     if command == "propose":
-        card = propose(args.symbol)
+        card = propose(args.symbol, cik=args.cik)
         return {"card": card_view(card), "line": _line(card), "prefix": card.digest[:PREFIX_LEN]}
     if command == "approve":
         order = approve_at_terminal()
@@ -625,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     parsers = {name: sub.add_parser(name, help=text) for name, text in commands.items()}
     parsers["propose"].add_argument("symbol")
+    parsers["propose"].add_argument("--cik", help="SEC CIK: show the desk point in time facts")
     parsers["reject"].add_argument("prefix")
     for each in parsers.values():
         each.add_argument("--json", action="store_true", help="machine JSON on stdout")

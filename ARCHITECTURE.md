@@ -3,7 +3,7 @@
 _How it is built. Committed. Update in the same commit as any change to the flow, layout, or stack._
 
 ## Flow
-- propose: kill switch check, `keychain` keys, `data` (calendar sets `as_of`, SIP daily RAW bars, both through `cache`; stale refuses), account snapshot (a tripped breaker refuses), a spend reservation of the $0.25 call cap, `desk` (one clean claude call in its own process group, schema only), the cost settled, `proposal` (code sizes qty and limit, buy or sell, sha256 digest, expiry at the next session close), `gate` (pure verdict), `ledger` (card row and an event).
+- propose: kill switch check, `keychain` keys, `data` (calendar sets `as_of`, SIP daily RAW bars, both through `cache`; stale refuses), account snapshot (a tripped breaker refuses), with `--cik` the EDGAR facts filed by `as_of` (before any spend), the desk's settled record from the ledger, a spend reservation of the $0.25 call cap, `desk` (one clean claude call in its own process group, schema only, seven roles in one prompt, EDGAR text and the record inside a fresh nonce fence; a rationale echoing the nonce or a fence tag is REVIEW), the cost settled, `proposal` (code sizes qty and limit, buy or sell, sha256 digest, expiry at the next session close), `gate` (pure verdict), `ledger` (card row and an event).
 - settle: every buy or sell card with no settlement whose fifth session after `as_of` has closed on the exchange calendar: adjusted closes P0 (as_of) and P5, the same two SPY closes, raw return (a sell wins when the price falls), alpha in bps, `won = R > 0`, Brier on the desk's confidence; `fill` when its order filled any shares, else `counterfactual`. A bad or missing close skips the card with its reason. Settlement and score rows are written once, in one transaction.
 - score: offline; settled cards of the model desks only (code built cards are left out): win rate, mean return, mean alpha, mean Brier, paired percentile bootstrap CIs (1,000 resamples, `random.Random(42)`).
 - breaker input: the latest settled fills with `R <= 0` in a row, ordered by horizon close then card creation; 3 in a row trips `CIRCUIT_BREAKER` at the next propose or approve.
@@ -14,7 +14,7 @@ _How it is built. Committed. Update in the same commit as any change to the flow
 - `alpaca-py==0.44.0`: the only runtime dependency; trading, calendar and market data in one SDK (brings pydantic, used for the desk schema).
 - sqlite (stdlib) under `TRADERBOT_HOME`, default `~/.traderbot`: the ledger and a separate read through cache (`cache.sqlite`), no server.
 - `urllib.request` (stdlib) for SEC EDGAR companyfacts on `data.sec.gov`, with a fixed `User-Agent`.
-- `claude` CLI headless on a clean profile for the desk: no tools, no MCP, env allowlist, pinned `claude-sonnet-5-5`.
+- `claude` CLI headless on a clean profile for the desk: no tools, no MCP, env allowlist, pinned `claude-sonnet-5-5`; one call walks seven roles (Macro, Technical, Fundamentals, Flow/Sentiment, Tail-Risk, Devil's Advocate Bear, Portfolio Manager Arbiter), so the cap and the profile cover the whole desk. Its cards carry `desk_label` `full`.
 
 ## Layout
 - `src/traderbot/cli.py`: argparse commands and their readable output.
@@ -27,7 +27,9 @@ _How it is built. Committed. Update in the same commit as any change to the flow
 - `src/traderbot/data.py`: the calendar (cached a day) and SIP daily closes. RAW closes size orders and feed the gate; `Adjustment.ALL` closes feed settlement, desk context and backtests, cached under the ET fetch date because a later split or dividend rewrites them. A window whose `as_of` bar is not served whole is never cached.
 - `src/traderbot/fundamentals.py`: EDGAR companyfacts; `point_in_time_facts` keeps only facts with `filed <= as_of` and `end <= as_of`, the latest period per field, `Decimal` values. `scripts/pit_check.py` proves it on a live fetch.
 - `src/traderbot/scoring.py`: pure settlement (`horizon_session`, `forward_return`, `settle`) and `score_summary`; the definitions in its docstring are the only ones.
-- `src/traderbot/{fence,backtest,live_gate}.py`: loud stubs until their phase.
+- `src/traderbot/text.py`: `shown`, the one escape for terminal and prompt text (`cli.shown` is the same function).
+- `src/traderbot/fence.py`: `new_nonce` (128 bits), `wrap_untrusted` (escaped to one line, `&<>` as entities, the nonce struck, then tagged `<fence_LABEL_NONCE>`), `preamble`, `verify_no_fence_leak`.
+- `src/traderbot/{backtest,live_gate}.py`: loud stubs until their phase.
 - `tests/test_smoke.py`: the live path in two halves, the real desk and a code built buy through approve (marked `live`, deselected by default). `tests/conftest.py` makes claude, the Keychain, every `requests` call, `urllib.request.urlopen` and the EDGAR reader tripwires in offline tests and points `TRADERBOT_HOME` at `tmp_path`.
 
 ## Boundaries
@@ -55,3 +57,5 @@ Ideas rebuilt in original code; nothing is pasted from `repos/` (OpenBB `develop
 | TTL cache that never serves a partial or stale window as fresh | osiris `sourceCache.ts` (`audits/COMPARISON.md`, worth rebuilding) | MIT | 3 |
 | Score a decision only after its holding window trades (deferred settlement) | tradingagents (`audits/COMPARISON.md`, worth rebuilding) | Apache 2.0 | 4 |
 | A Brier ledger scored against settled outcomes, never the model grading itself | osiris PYTHIA idea (`audits/COMPARISON.md`, worth rebuilding) | MIT | 4 |
+| Scraped text is data in a quoted channel the model is told it cannot obey; output that plays the channel back is refused | `audits/COMPARISON.md` pattern 2 (tradingagents and tradingview-mcp pass scraped text unmarked); the nonce and the leak check are new | n/a (a finding, no code) | 5 |
+| Staged roles with a bear and an arbiter before the answer | tradingagents bull, bear, judge and risk review (`audits/COMPARISON.md`, worth rebuilding), here in one call | Apache 2.0 | 5 |

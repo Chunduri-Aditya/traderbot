@@ -95,7 +95,9 @@ def test_off_during_the_desk_call_still_stores_an_allowed_card(
     missed and the stored card says ALLOW (and the readable view prints the approve line).
     """
 
-    def desk_then_off(bars: data.Bars, position_qty: int = 0) -> desk.DeskResult:
+    def desk_then_off(
+        bars: data.Bars, position_qty: int = 0, context: object = None
+    ) -> desk.DeskResult:
         ledger.set_kill_switch(True)  # Aditya runs `traderbot off` while the desk is thinking
         return buy(bars)
 
@@ -125,7 +127,9 @@ def test_off_seen_by_the_snapshot_still_pays_for_a_desk_call(
         ledger.set_kill_switch(True)  # `traderbot off` lands while the bars load
         return BARS
 
-    def counted_desk(bars: data.Bars, position_qty: int = 0) -> desk.DeskResult:
+    def counted_desk(
+        bars: data.Bars, position_qty: int = 0, context: object = None
+    ) -> desk.DeskResult:
         calls.append(bars.symbol)
         return buy(bars)
 

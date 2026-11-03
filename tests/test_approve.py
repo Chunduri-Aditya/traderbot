@@ -14,9 +14,9 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
-from support import NEXT_CLOSE, NOW, SESSIONS, a_card, trip
+from support import AS_OF, NEXT_CLOSE, NOW, SESSIONS, a_card, trip
 
-from traderbot import broker, cli, data, desk, gate, keychain, ledger
+from traderbot import broker, cli, data, desk, fundamentals, gate, keychain, ledger
 from traderbot import proposal as prop
 
 
@@ -226,7 +226,9 @@ def test_approve_then_reject_is_refused(
 
 
 def desk_says(side: Literal["buy", "sell", "hold"], cost: str = "0.0132") -> Any:
-    def decide(bars: data.Bars, position_qty: int = 0) -> desk.DeskResult:
+    def decide(
+        bars: data.Bars, position_qty: int = 0, context: desk.DeskContext | None = None
+    ) -> desk.DeskResult:
         choice = prop.DeskChoice(symbol=bars.symbol, side=side, rationale="r", confidence=0.5)
         return desk.DeskResult(choice, None, Decimal(cost), (desk.MODEL,))
 
@@ -291,7 +293,9 @@ def test_propose_settles_the_desk_cost_and_stamps_the_expiry(
 def test_a_desk_crash_leaves_the_reservation_held(
     conn: sqlite3.Connection, live_stubs: None, fresh_bars: None
 ) -> None:
-    def crash(bars: data.Bars, position_qty: int = 0) -> desk.DeskResult:
+    def crash(
+        bars: data.Bars, position_qty: int = 0, context: desk.DeskContext | None = None
+    ) -> desk.DeskResult:
         raise RuntimeError("desk crashed")
 
     with pytest.raises(RuntimeError, match="desk crashed"):
@@ -330,7 +334,7 @@ def test_a_control_card_is_labelled_so_scoring_can_leave_it_out(
 ) -> None:
     card = cli.propose("SPY", decide=desk_says("buy"), desk_label="control")
     assert card.proposal.desk == "control"
-    assert cli.propose("SPY", decide=desk_says("hold")).proposal.desk == "single"
+    assert cli.propose("SPY", decide=desk_says("hold")).proposal.desk == "full"
 
 
 def test_approve_after_a_submit_that_never_arrived_submits_again_once(
@@ -386,3 +390,41 @@ def test_rejecting_an_unconfirmed_claim_frees_its_order_slot(
     assert cli.reject(key[:8]) == "reject"  # Alpaca has no order under the digest
     assert ledger.claim_state(conn, key, NOW) is None
     assert ledger.orders_today(conn, NOW.date()) == 0
+
+
+# Phase 5: what propose hands the desk
+
+
+def test_propose_refuses_a_bad_cik_before_any_key_read(conn: sqlite3.Connection) -> None:
+    with pytest.raises(cli.Refused, match="CIK"):
+        cli.propose("SPY", decide=trip, cik="12a")
+
+
+def test_propose_hands_the_desk_point_in_time_facts_and_its_record(
+    conn: sqlite3.Connection,
+    live_stubs: None,
+    fresh_bars: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[tuple[str, str, date]] = []
+    contexts: list[desk.DeskContext] = []
+    snap = fundamentals.FundamentalSnapshot("SPY", "0000320193", "Acme", AS_OF, (), ())
+
+    def load(symbol: str, cik: str, as_of: date, now: Any) -> fundamentals.FundamentalSnapshot:
+        asked.append((symbol, cik, as_of))
+        return snap
+
+    def decide(
+        bars: data.Bars, position_qty: int = 0, context: desk.DeskContext | None = None
+    ) -> desk.DeskResult:
+        assert context is not None
+        contexts.append(context)
+        result: desk.DeskResult = desk_says("hold")(bars, position_qty)
+        return result
+
+    monkeypatch.setattr(fundamentals, "load_snapshot", load)
+    card = cli.propose("SPY", decide=decide, cik="320193")
+    assert asked == [("SPY", "320193", AS_OF)]  # facts as of the card's own session
+    assert contexts[0].fundamentals is snap
+    assert contexts[0].track_record is not None and contexts[0].track_record.settled == 0
+    assert card.proposal.desk == "full"

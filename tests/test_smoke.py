@@ -147,7 +147,7 @@ def placed_client_ids(alpaca: TradingClient) -> Iterator[list[str]]:
             alpaca.cancel_order_by_id(order.id)
 
 
-def code_built_buy(bars: Bars, position_qty: int = 0) -> DeskResult:
+def code_built_buy(bars: Bars, position_qty: int = 0, context: object = None) -> DeskResult:
     choice = DeskChoice(
         symbol=bars.symbol,
         side="buy",

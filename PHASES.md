@@ -29,7 +29,8 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 - [ ] A live `settle` on the real ledger once a card is 5 sessions old (Aditya's Mac: needs the Keychain).
 
 ## Phase 5: desk
-- [ ] Nonce fence, seven role full desk, REVIEW on any role failure or budget stop; a live full desk card.
+- [x] Nonce fence (`fence.py`), seven role desk in one call (`desk_label` `full`), EDGAR facts by `--cik` and the settled record fenced in the prompt, REVIEW on a fence leak, a budget stop (any stop reason but `end_turn` or `tool_use`) or any other desk failure; tests in `test_fence.py`, `test_desk.py` (forged closes in an EDGAR name and a form code, a nonce echoed back through `decide`) and `test_approve.py`.
+- [ ] A live full desk card (Aditya's Mac: needs the Keychain and the claude CLI).
 
 ## Phase 6: baseline and live check
 - [ ] Rules baseline backtest equals hand values; `live-check` prints FAIL with reasons on a young ledger.
