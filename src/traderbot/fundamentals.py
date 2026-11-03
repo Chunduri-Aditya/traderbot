@@ -21,6 +21,7 @@ from typing import Any
 from traderbot import cache
 
 EDGAR_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 USER_AGENT = "traderbot/0.1 (local-paper-research)"
 CIK_RE = re.compile(r"[0-9]{1,10}")
 TIMEOUT_S = 20
@@ -102,6 +103,21 @@ def fetch_company_facts(cik: str, now: datetime) -> Any:
     return cache.get_or_fetch(
         "edgar_facts", cik10(cik), now, FACTS_TTL_S, lambda: _http_get_json(url, headers)
     )
+
+
+def check_ticker(symbol: str, cik: str, now: datetime) -> None:
+    """ValueError unless EDGAR lists `symbol` among the tickers of `cik` (BRK.B reads BRK-B)."""
+    padded = cik10(cik)
+    url = SUBMISSIONS_URL.format(cik=padded)
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    payload = cache.get_or_fetch(
+        "edgar_submissions", padded, now, FACTS_TTL_S, lambda: _http_get_json(url, headers)
+    )
+    raw = payload.get("tickers") if isinstance(payload, Mapping) else None
+    tickers = [t.upper() for t in raw if isinstance(t, str)] if isinstance(raw, list) else []
+    if symbol.upper().replace(".", "-") not in tickers:
+        listed = ", ".join(tickers[:5]) or "none"
+        raise ValueError(f"CIK {cik} is not {symbol} on EDGAR (its tickers: {listed})")
 
 
 def _day(raw: object) -> date | None:

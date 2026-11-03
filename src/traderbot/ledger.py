@@ -543,21 +543,32 @@ def consecutive_losses(conn: sqlite3.Connection) -> int:
 
 
 def unsettled(conn: sqlite3.Connection) -> list[Card]:
-    """Buy and sell cards with no settlement yet, oldest first."""
+    """Every card with no settlement yet, oldest first. The caller checks each digest and reads
+    the side from the signed proposal, never from the unsigned `side` column."""
     rows = conn.execute(
-        f"{_SELECT} WHERE c.side IN ('buy', 'sell')"
-        " AND c.digest NOT IN (SELECT digest FROM settlements) ORDER BY c.created_at"
+        f"{_SELECT} WHERE c.digest NOT IN (SELECT digest FROM settlements) ORDER BY c.created_at"
     )
     return [_card(row) for row in rows.fetchall()]
 
 
+UNFILLED_END = frozenset({"canceled", "expired", "rejected", "done_for_day"})
+
+
 def settlement_kind(card: Card) -> str:
-    """`fill` once the card's order filled any shares, else `counterfactual`."""
+    """`counterfactual` only when no order exists, or the order ended with an explicit zero
+    fill; every other state (filled, partially filled, open, unconfirmed, unknown) is `fill`,
+    so a real loss can never miss the circuit breaker."""
+    if card.order_status is None:
+        return "counterfactual"
     try:
-        filled = Decimal(card.filled_qty) if card.filled_qty else Decimal(0)
+        filled = Decimal(card.filled_qty) if card.filled_qty is not None else None
     except ArithmeticError:
-        filled = Decimal(0)
-    return "fill" if filled.is_finite() and filled > 0 else "counterfactual"
+        filled = None
+    if filled is not None and filled.is_finite() and filled > 0:
+        return "fill"
+    if card.order_status in UNFILLED_END and filled == 0:
+        return "counterfactual"
+    return "fill"
 
 
 def record_settlement(conn: sqlite3.Connection, s: scoring.Settlement) -> bool:

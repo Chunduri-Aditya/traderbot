@@ -179,13 +179,12 @@ def history(
     if adjustment != Adjustment.RAW:
         key += f":fetched {now.date().isoformat()}"
         ttl = ADJUSTED_TTL_S
-    rows = cache.get_or_fetch(
-        "bars",
-        key,
-        now,
-        ttl,
-        lambda: [[day.isoformat(), str(close)] for day, close in fetch()],
-    )
+    rows = cache.peek("bars", key, now, ttl)
+    if rows is None:
+        fresh = fetch()
+        if not fresh or fresh[-1][0] != as_of.day:
+            return fresh  # Alpaca has not served the as_of bar yet: never cache the window
+        rows = cache.put("bars", key, now, [[day.isoformat(), str(c)] for day, c in fresh])
     return [(date.fromisoformat(day), Decimal(close)) for day, close in rows]
 
 

@@ -139,6 +139,11 @@ def propose(
     conn = ledger.connect()
     if ledger.kill_switch_on():
         raise Refused("the kill switch is on (`traderbot on` clears it); no desk call made")
+    if cik is not None:
+        try:
+            fundamentals.check_ticker(symbol, cik, now)
+        except ValueError as err:
+            raise Refused(f"{err}; no desk call made") from err
     keys = keychain.load()
     trading = broker.client(keys)
     bars = data.daily_bars(trading, keys, symbol, now)
@@ -403,18 +408,29 @@ def settle() -> dict[str, Any]:
                 series[symbol] = dict(data.history(keys, symbol, start, as_of, now, Adjustment.ALL))
             return series[symbol]
 
+        served = now - data.SIP_DELAY  # a horizon bar counts once Alpaca serves it whole
         for card in pending:
             short = card.digest[:PREFIX_LEN]
             p = card.proposal
+            if p.side not in scoring.SCORED_SIDES:
+                continue
             try:
+                if prop.digest_of(card.proposal_json) != card.digest:
+                    raise ValueError("card was altered after it was stored")
                 if not SYMBOL_RE.fullmatch(p.symbol):
                     raise ValueError(f"card symbol {p.symbol!r} is not a US stock or ETF symbol")
-                if scoring.horizon_session(calendar, p.as_of, now) is None:
+                if scoring.horizon_session(calendar, p.as_of, served) is None:
                     waiting.append(short)
                     continue
-                kind = ledger.settlement_kind(card)
+                kind = ledger.settlement_kind(_refreshed(conn, trading, card, now))
                 result = scoring.settle(
-                    p, card.digest, kind, calendar, closes(p.symbol), closes(scoring.BENCHMARK), now
+                    p,
+                    card.digest,
+                    kind,
+                    calendar,
+                    closes(p.symbol),
+                    closes(scoring.BENCHMARK),
+                    served,
                 )
             except ValueError as err:
                 skipped.append({"digest": short, "reason": str(err)})
@@ -426,6 +442,26 @@ def settle() -> dict[str, Any]:
                 ledger.log_event(conn, "settle", now, card.digest, view)
                 settled.append(view)
     return {"settled": settled, "waiting": waiting, "skipped": skipped}
+
+
+def _refreshed(
+    conn: sqlite3.Connection, trading: TradingClient, card: ledger.Card, now: datetime
+) -> ledger.Card:
+    """The card with its order state read again from Alpaca, when it has an order row."""
+    if card.order_status is None:
+        return card
+    found = broker.order_by_client_id(trading, card.digest)
+    if found is not None:
+        ledger.record_order(
+            conn,
+            card.digest,
+            str(found.id),
+            found.status.value,
+            now,
+            None if found.filled_qty is None else str(found.filled_qty),
+            None if found.filled_avg_price is None else str(found.filled_avg_price),
+        )
+    return ledger.find(conn, card.digest)
 
 
 def settlement_view(s: scoring.Settlement) -> dict[str, Any]:
@@ -451,8 +487,9 @@ def report_view(report: scoring.ScoreReport) -> dict[str, Any]:
 
 
 def desk_report(conn: sqlite3.Connection) -> scoring.ScoreReport:
-    """The model desks' record: settled desk cards only, code built cards left out."""
-    return scoring.score_summary(scoring.scorable(ledger.settlements(conn)))
+    """The model desks' record: settled desk cards only, code built cards left out, one
+    outcome per symbol and session."""
+    return scoring.score_summary(scoring.independent(scoring.scorable(ledger.settlements(conn))))
 
 
 def score() -> dict[str, Any]:
@@ -476,7 +513,9 @@ def run_backtest(raw_symbol: str, strategy: str, days: int = BACKTEST_DAYS) -> d
     closes = data.history(keys, symbol, start, as_of, now, Adjustment.ALL)
     spy = dict(data.history(keys, scoring.BENCHMARK, start, as_of, now, Adjustment.ALL))
     try:
-        report = backtest.run(symbol, closes, spy, backtest.STRATEGIES[strategy], LIMITS)
+        report = backtest.run(
+            symbol, closes, spy, backtest.STRATEGIES[strategy], LIMITS, sessions=calendar
+        )
     except ValueError as err:
         raise Refused(f"backtest of {symbol} refused: {err}") from err
     view = backtest_view(report)
@@ -498,6 +537,7 @@ def backtest_view(r: backtest.BacktestReport) -> dict[str, Any]:
         "denied": r.denied,
         "deny_reasons": dict(r.deny_reasons),
         "open_orders": r.open_orders,
+        "unscorable": r.unscorable,
         "final_equity": str(r.final_equity),
         "buy_and_hold_return": str(r.buy_and_hold_return),
         "spy_return": None if r.spy_return is None else str(r.spy_return),

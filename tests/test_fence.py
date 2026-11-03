@@ -59,7 +59,7 @@ def test_the_nonce_itself_is_struck_from_content(leak: str) -> None:
         ("\x1b[31mred", "\\x1b[31mred"),
         ("x" + chr(0x202E) + "y", "x\\u202ey"),
         ("x\u200by", "x\\u200by"),
-        ("x" + chr(0x3164) + "y", "x\\u3164y"),
+        ("x" + chr(0x3164) + "y", "x\\u1160y"),  # NFKC folds one Hangul filler to another
     ],
 )
 def test_control_bidi_and_invisible_characters_are_visible(raw: str, escaped: str) -> None:

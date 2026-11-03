@@ -39,4 +39,5 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 
 ## Phase 7: Fable audit
 - [x] Cloud session attack pass: `tests/test_attack_p3_p6.py`, 18 vectors; 2 holes found red and fixed (a NaN body served from the cache, a fence tag hidden by an invisible character); findings and known limits in `audits/traderbot-phase7-audit.md`.
+- [x] Independent reviewer: 8 findings (R1 to R8, one high: a real losing fill could miss the breaker), each red in `tests/test_attack_p7_review.py` before its fix and green after.
 - [ ] Four fresh Fable reviewers; findings in `audits/traderbot-fable-audit.md`; fixes land with failing tests first.

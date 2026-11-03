@@ -245,6 +245,19 @@ def report_from_json(raw: dict[str, Any]) -> ScoreReport:
     )
 
 
+def independent(settlements: Sequence[Settlement]) -> list[Settlement]:
+    """One settlement per (symbol, as_of): cards on the same symbol and session share one
+    outcome, so copies would shrink the bootstrap CI without adding evidence. The first known
+    one stands. Horizons that overlap across days still correlate; this removes exact copies."""
+    seen: set[tuple[str, date]] = set()
+    kept: list[Settlement] = []
+    for s in sorted(settlements, key=lambda s: (s.settled_at, s.digest)):
+        if (s.symbol, s.as_of) not in seen:
+            seen.add((s.symbol, s.as_of))
+            kept.append(s)
+    return kept
+
+
 def scorable(settlements: Sequence[Settlement]) -> list[Settlement]:
     """Settlements of model desk cards only; code built cards never score the desk."""
     return [s for s in settlements if s.desk in SCORED_DESKS]

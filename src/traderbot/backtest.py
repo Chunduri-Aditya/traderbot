@@ -70,7 +70,8 @@ class BacktestReport:
     allowed: int
     denied: int
     deny_reasons: tuple[tuple[str, int], ...]
-    open_orders: int  # allowed within the last 5 bars, not yet settled
+    open_orders: int  # allowed, not settled: within the last 5 sessions or unscorable
+    unscorable: int  # allowed, but a close the horizon needs is missing
     final_equity: Decimal
     buy_and_hold_return: Decimal
     spy_return: Decimal | None
@@ -145,18 +146,24 @@ def run(
     strategy: Strategy,
     limits: gate.Limits = gate.Limits(),  # noqa: B008 (frozen dataclass)
     initial_cash: Decimal = INITIAL_CASH,
+    sessions: Sequence[Session] | None = None,
 ) -> BacktestReport:
-    """Walk `closes` (adjusted, oldest first) bar by bar; pure: no clock, no I/O."""
+    """Walk `closes` (adjusted, oldest first) bar by bar; pure: no clock, no I/O.
+
+    `sessions` is the exchange calendar the horizon counts on; without it the bars' own days
+    stand in. A trade whose horizon bar is missing (a halt, a data gap) stays unscored."""
     _validate(closes)
     days = [day for day, _ in closes]
     by_day = dict(closes)
-    sessions = [
-        Session(day=d, open=_at(d, SESSION_OPEN), close=_at(d, SESSION_CLOSE)) for d in days
-    ]
+    if sessions is None:
+        sessions = [
+            Session(day=d, open=_at(d, SESSION_OPEN), close=_at(d, SESSION_CLOSE)) for d in days
+        ]
     end_of_data = _at(days[-1], SESSION_CLOSE) + DECIDED_AFTER
     cash, held, peak = initial_cash, 0, initial_cash
     trades: list[SimTrade] = []
     settled: list[scoring.Settlement] = []
+    unscorable = 0
     for i, (day, close) in enumerate(closes):
         equity = cash + held * close
         peak = max(peak, equity)
@@ -208,7 +215,13 @@ def run(
         else:
             cash += qty * limit
             held -= qty
-        result = scoring.settle(card, prop.digest(card), "fill", sessions, by_day, spy, end_of_data)
+        try:
+            result = scoring.settle(
+                card, prop.digest(card), "fill", sessions, by_day, spy, end_of_data
+            )
+        except ValueError:
+            result = None
+            unscorable += 1
         if result is not None:
             settled.append(result)
         trades.append(SimTrade(day, side, qty, limit, True, (), result))
@@ -231,6 +244,7 @@ def run(
         denied=len(trades) - len(allowed),
         deny_reasons=tuple(sorted(reasons.items())),
         open_orders=sum(1 for t in allowed if t.settlement is None),
+        unscorable=unscorable,
         final_equity=cash + held * last,
         buy_and_hold_return=(last - first) / first,
         spy_return=spy_return,

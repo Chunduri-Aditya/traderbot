@@ -15,6 +15,7 @@ turns that answer into REVIEW.
 
 import re
 import secrets
+import unicodedata
 
 from traderbot.text import shown, visible_only
 
@@ -36,8 +37,14 @@ def _check(label: str, nonce: str) -> None:
 
 
 def sanitize(content: str, nonce: str) -> str:
-    """One visible line with no markup and without the nonce."""
-    flat = shown(content).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """One visible line with no markup and without the nonce; NFKC first, so a fullwidth or
+    small form `<` folds to the ASCII one and is escaped with it."""
+    flat = (
+        shown(unicodedata.normalize("NFKC", content))
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
     return re.sub(re.escape(nonce), STRUCK, flat, flags=re.IGNORECASE)
 
 

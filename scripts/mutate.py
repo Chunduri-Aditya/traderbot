@@ -180,6 +180,12 @@ LIVE_ROWS: list[tuple[str, str, str, str]] = [
         "test_allow_at_every_boundary",
     ),
     (
+        "live: a baseline thinner than the desk's minimum is no baseline",
+        "        or baseline.settled < limits.min_settlements\n",
+        "",
+        "test_no_baseline_deny_on_a_thin_baseline",
+    ),
+    (
         "live fail closed: no CI is a deny",
         "if score.alpha_ci is None or score.alpha_ci[0]",
         "if score.alpha_ci is not None and score.alpha_ci[0]",

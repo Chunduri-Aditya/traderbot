@@ -69,6 +69,11 @@ def test_no_baseline_deny() -> None:
     assert denies(check(baseline=replace(BASELINE, mean_alpha_bps=None)), "NO_BASELINE")
 
 
+def test_no_baseline_deny_on_a_thin_baseline() -> None:
+    # The allow sits on the limit: BASELINE has exactly 20 settled (test_allow_at_every_boundary).
+    assert denies(check(baseline=replace(BASELINE, settled=19)), "NO_BASELINE")
+
+
 def test_underperforms_baseline_deny() -> None:
     better = replace(BASELINE, mean_alpha_bps=Decimal("30.01"))
     assert denies(check(baseline=better), "UNDERPERFORMS_BASELINE")

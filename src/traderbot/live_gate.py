@@ -3,7 +3,8 @@ baseline. No I/O, no clock. Passing it builds nothing: no live code path exists,
 still needs a separate plan Aditya approves (PRD non goals).
 
 Every rule runs and a FAIL lists each code that applies. A missing number fails its rule (fail
-closed): no CI is NEGATIVE_ALPHA_CI, no Brier is BRIER_OVER_MAX, no mean alpha underperforms.
+closed): no CI is NEGATIVE_ALPHA_CI, no Brier is BRIER_OVER_MAX, no mean alpha underperforms,
+and a baseline with fewer settled trades than the desk needs is NO_BASELINE.
 """
 
 from dataclasses import dataclass
@@ -56,7 +57,11 @@ def check_live_readiness(
         reasons.append("NEGATIVE_ALPHA_CI")
     if score.mean_brier is None or score.mean_brier > limits.max_brier:
         reasons.append("BRIER_OVER_MAX")
-    if baseline is None or baseline.mean_alpha_bps is None:
+    if (
+        baseline is None
+        or baseline.mean_alpha_bps is None
+        or baseline.settled < limits.min_settlements
+    ):
         reasons.append("NO_BASELINE")
     elif score.mean_alpha_bps is None or score.mean_alpha_bps < baseline.mean_alpha_bps:
         reasons.append("UNDERPERFORMS_BASELINE")

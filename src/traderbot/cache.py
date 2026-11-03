@@ -150,6 +150,32 @@ def lookup(conn: sqlite3.Connection, namespace: str, key: str, now: datetime, tt
         return None
 
 
+def put(namespace: str, key: str, now: datetime, value: Any) -> Any:
+    """Store `value` as canonical JSON; return it parsed back, as a hit would."""
+    if not NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(f"cache namespace must match {NAMESPACE_RE.pattern}, got {namespace!r}")
+    body = canonical(value)
+    conn = connect()
+    try:
+        with _immediate(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?)",
+                (namespace, key, now.isoformat(), body, _digest(body)),
+            )
+    finally:
+        conn.close()
+    return json.loads(body)
+
+
+def peek(namespace: str, key: str, now: datetime, ttl_seconds: int) -> Any:
+    """A fresh stored value or None, with no fetch."""
+    conn = connect()
+    try:
+        return lookup(conn, namespace, key, now, ttl_seconds)
+    finally:
+        conn.close()
+
+
 def get_or_fetch(
     namespace: str,
     key: str,

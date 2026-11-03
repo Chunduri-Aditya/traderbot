@@ -423,6 +423,7 @@ def test_propose_hands_the_desk_point_in_time_facts_and_its_record(
         return result
 
     monkeypatch.setattr(fundamentals, "load_snapshot", load)
+    monkeypatch.setattr(fundamentals, "check_ticker", lambda symbol, cik, now: None)
     card = cli.propose("SPY", decide=decide, cik="320193")
     assert asked == [("SPY", "320193", AS_OF)]  # facts as of the card's own session
     assert contexts[0].fundamentals is snap
