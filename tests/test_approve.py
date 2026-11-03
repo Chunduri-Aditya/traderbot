@@ -8,13 +8,13 @@ power and equity, no position, no open orders, the clock at 18:00 ET on 2026-09-
 import sqlite3
 import uuid
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
-from support import NEXT_CLOSE, NOW, SESSIONS, a_card, trip
+from support import ET, NEXT_CLOSE, NOW, SESSIONS, a_card, trip
 
 from traderbot import broker, cli, data, desk, gate, keychain, ledger
 from traderbot import proposal as prop
@@ -386,3 +386,60 @@ def test_rejecting_an_unconfirmed_claim_frees_its_order_slot(
     assert cli.reject(key[:8]) == "reject"  # Alpaca has no order under the digest
     assert ledger.claim_state(conn, key, NOW) is None
     assert ledger.orders_today(conn, NOW.date()) == 0
+
+
+MONDAY = datetime(2026, 11, 2, 17, 0, tzinfo=ET)  # after Monday's close
+TUESDAY = datetime(2026, 11, 3, 10, 0, tzinfo=ET)  # in Tuesday's session
+TUESDAY_CLOSE = datetime(2026, 11, 3, 16, 0, tzinfo=ET)
+MONDAY_TUESDAY = [
+    data.Session(
+        day=MONDAY.date(),
+        open=datetime(2026, 11, 2, 9, 30, tzinfo=ET),
+        close=datetime(2026, 11, 2, 16, 0, tzinfo=ET),
+    ),
+    data.Session(
+        day=TUESDAY.date(), open=datetime(2026, 11, 3, 9, 30, tzinfo=ET), close=TUESDAY_CLOSE
+    ),
+]
+
+
+def test_a_monday_submit_retried_on_tuesday_counts_against_tuesday(
+    conn: sqlite3.Connection, live_stubs: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Monday's card expires at Tuesday's close, so the retry cannot fail on CARD_EXPIRED."""
+    clock = [MONDAY]
+    monkeypatch.setattr(data, "now_et", lambda: clock[0])
+    monkeypatch.setattr(data, "sessions", lambda trading, start, end: MONDAY_TUESDAY)
+    monday = MONDAY.date()
+    cards = [
+        a_card(
+            rationale=f"monday card {n}",
+            as_of=monday,
+            bar_date=monday,
+            created_at=MONDAY,
+            expires_at=TUESDAY_CLOSE,
+        )
+        for n in range(4)
+    ]
+    keys = [store(conn, card, gate.Allow()) for card in cards]
+
+    def unreachable(trading: object, card: prop.Proposal, client_order_id: str) -> Any:
+        raise ConnectionError("Failed to establish a new connection")
+
+    monkeypatch.setattr(broker, "submit_limit_order", unreachable)
+    with pytest.raises(ConnectionError):
+        cli.approve(keys[0][:8])
+    assert ledger.claim_state(conn, keys[0], MONDAY) == "unconfirmed"
+    clock[0] = TUESDAY
+    placed = []
+    for key in keys[:3]:  # the retry, then two more cards
+        order = placed_order(key)
+        submitted = recording_submit(monkeypatch, order)
+        assert cli.approve(key[:8]) is order
+        placed += [cid for _, cid in submitted]
+    submitted = recording_submit(monkeypatch, placed_order(keys[3]))
+    with pytest.raises(cli.Refused, match="DAILY_ORDER_CAP"):
+        cli.approve(keys[3][:8])
+    assert (placed, submitted) == (keys[:3], [])
+    assert ledger.orders_today(conn, TUESDAY.date()) == 3
+    assert ledger.orders_today(conn, monday) == 0

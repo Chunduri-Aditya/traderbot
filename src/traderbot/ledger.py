@@ -253,26 +253,38 @@ def claim_order(conn: sqlite3.Connection, key: str, cap: int, now: datetime) -> 
     A claim is an `orders` row with an empty order id. It is refused when the card was rejected,
     when an order was placed, when another approve's claim is younger than CLAIM_TTL_S, or when
     the day's orders, claims included, already reach `cap`. An unconfirmed or stale claim (a
-    submit that failed or a process that died) is taken over, keeping its place in the count.
+    submit that failed or a process that died) is taken over. Taken over the same day, it keeps
+    its place in the count. Taken over on a later day, it moves to that day, which must have a
+    free slot, so it counts once and against the day its order is sent.
     """
+    day = now.date().isoformat()
     with _immediate(conn):
         decided = conn.execute("SELECT decision FROM decisions WHERE digest = ?", (key,))
         row = decided.fetchone()
         if row is not None and row[0] == "reject":
             raise ClaimRefused("was rejected")
         held = conn.execute(
-            "SELECT order_id, status, updated_at FROM orders WHERE digest = ?", (key,)
+            "SELECT order_id, status, updated_at, submitted_day FROM orders WHERE digest = ?",
+            (key,),
         ).fetchone()
         if held is not None:
-            order_id, status, updated_at = held
+            order_id, status, updated_at, submitted_day = held
             if order_id:
                 raise ClaimRefused(f"already has order {order_id}")
             age = (now - datetime.fromisoformat(updated_at)).total_seconds()
             if status == "submitting" and age <= CLAIM_TTL_S:
                 raise ClaimRefused("is being submitted by another approve; run approve again")
+            if submitted_day < day:
+                (count,) = conn.execute(
+                    "SELECT count(*) FROM orders WHERE submitted_day = ?", (day,)
+                ).fetchone()
+                if count >= cap:
+                    raise ClaimRefused("gate denies it now: DAILY_ORDER_CAP")
+                submitted_day = day
             conn.execute(
-                "UPDATE orders SET status = 'submitting', updated_at = ? WHERE digest = ?",
-                (now.isoformat(), key),
+                "UPDATE orders SET status = 'submitting', updated_at = ?, submitted_day = ?"
+                " WHERE digest = ?",
+                (now.isoformat(), submitted_day, key),
             )
             return
         (count,) = conn.execute(

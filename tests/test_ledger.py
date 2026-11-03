@@ -2,11 +2,12 @@
 the equity peak, the loss streak, the breaker latch and the kill switch file."""
 
 import sqlite3
-from datetime import timedelta
+import threading
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from support import NOW, a_card
+from support import ET, NOW, a_card
 
 from traderbot import gate, ledger
 
@@ -199,3 +200,100 @@ def test_an_order_claim_counts_against_the_daily_cap(conn: sqlite3.Connection) -
     with pytest.raises(ledger.ClaimRefused, match="DAILY_ORDER_CAP"):
         ledger.claim_order(conn, keys[3], 3, NOW)  # both gates may have read 2 before either claim
     assert ledger.orders_today(conn, NOW.date()) == 3
+
+
+# A claim taken over on a later day moves to that day and counts against its cap
+
+MONDAY = datetime(2026, 11, 2, 17, 0, tzinfo=ET)  # after Monday's close
+TUESDAY = datetime(2026, 11, 3, 10, 0, tzinfo=ET)  # in Tuesday's session
+TAKEOVER_PATHS = ("unconfirmed", "stale_submitting")
+
+
+def monday_claim(conn: sqlite3.Connection, path: str, name: str = "monday claim") -> str:
+    """A Monday claim whose submit raised (unconfirmed) or whose approve died (submitting)."""
+    key = ledger.insert_card(conn, a_card(rationale=name), Decimal(0), (), gate.Allow())
+    ledger.claim_order(conn, key, 3, MONDAY)
+    if path == "unconfirmed":
+        ledger.unconfirm_claim(conn, key, MONDAY)
+    return key
+
+
+def tuesday_orders(conn: sqlite3.Connection, count: int) -> None:
+    for i in range(count):
+        card = a_card(rationale=f"tuesday order {i}")
+        key = ledger.insert_card(conn, card, Decimal(0), (), gate.Allow())
+        ledger.record_order(conn, key, f"order-{i}", "accepted", TUESDAY)
+
+
+def order_row(conn: sqlite3.Connection, key: str) -> tuple[str, str, str]:
+    row = conn.execute(
+        "SELECT submitted_day, status, updated_at FROM orders WHERE digest = ?", (key,)
+    ).fetchone()
+    return (str(row[0]), str(row[1]), str(row[2]))
+
+
+@pytest.mark.parametrize("path", TAKEOVER_PATHS)
+def test_a_monday_claim_taken_over_on_a_full_tuesday_is_refused(
+    conn: sqlite3.Connection, path: str
+) -> None:
+    key = monday_claim(conn, path)
+    tuesday_orders(conn, 3)
+    before = order_row(conn, key)
+    with pytest.raises(ledger.ClaimRefused, match="DAILY_ORDER_CAP"):
+        ledger.claim_order(conn, key, 3, TUESDAY)
+    assert order_row(conn, key) == before
+    assert before[0] == MONDAY.date().isoformat()
+    assert ledger.orders_today(conn, TUESDAY.date()) == 3
+
+
+@pytest.mark.parametrize("path", TAKEOVER_PATHS)
+def test_a_monday_claim_taken_over_on_tuesday_moves_to_tuesday(
+    conn: sqlite3.Connection, path: str
+) -> None:
+    key = monday_claim(conn, path)
+    tuesday_orders(conn, 2)
+    ledger.claim_order(conn, key, 3, TUESDAY)
+    assert order_row(conn, key)[:2] == (TUESDAY.date().isoformat(), "submitting")
+    assert ledger.orders_today(conn, TUESDAY.date()) == 3
+    assert ledger.orders_today(conn, MONDAY.date()) == 0
+
+
+def test_a_same_day_takeover_keeps_its_place_at_the_cap(conn: sqlite3.Connection) -> None:
+    tuesday_orders(conn, 2)
+    card = a_card(rationale="stale tuesday claim")
+    key = ledger.insert_card(conn, card, Decimal(0), (), gate.Allow())
+    ledger.claim_order(conn, key, 3, TUESDAY - timedelta(seconds=ledger.CLAIM_TTL_S + 1))
+    assert ledger.orders_today(conn, TUESDAY.date()) == 3  # the cap, this claim included
+    ledger.claim_order(conn, key, 3, TUESDAY)
+    assert order_row(conn, key)[:2] == (TUESDAY.date().isoformat(), "submitting")
+    assert ledger.orders_today(conn, TUESDAY.date()) == 3
+
+
+def test_two_monday_claims_taken_over_at_once_take_one_tuesday_slot(
+    conn: sqlite3.Connection,
+) -> None:
+    keys = [monday_claim(conn, "unconfirmed", f"monday claim {n}") for n in range(2)]
+    tuesday_orders(conn, 2)
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, str] = {}
+
+    def take_over(key: str) -> None:
+        own = ledger.connect()  # its own connection, as a second approve process would have
+        try:
+            barrier.wait(timeout=10)
+            ledger.claim_order(own, key, 3, TUESDAY)
+            outcomes[key] = "claimed"
+        except ledger.ClaimRefused as err:
+            outcomes[key] = str(err)
+        except (sqlite3.Error, threading.BrokenBarrierError) as err:  # fails the assert below
+            outcomes[key] = repr(err)
+        finally:
+            own.close()
+
+    threads = [threading.Thread(target=take_over, args=(key,)) for key in keys]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert sorted(outcomes.values()) == ["claimed", "gate denies it now: DAILY_ORDER_CAP"]
+    assert ledger.orders_today(conn, TUESDAY.date()) == 3
