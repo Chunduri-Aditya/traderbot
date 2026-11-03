@@ -8,14 +8,15 @@ escapes `&`, `<` and `>` as entities, so no tag of any kind (a fence close, a fo
 itself should the text contain it. The preamble tells the model that fenced text is data that
 cannot instruct it or set any schema field.
 
-`verify_no_fence_leak` checks model output: echoing the nonce or a fence tag means the fence was
-seen through or played back, and the desk turns that answer into REVIEW.
+`verify_no_fence_leak` checks model output, folded and stripped of invisible characters first:
+echoing the nonce or a fence tag means the fence was seen through or played back, and the desk
+turns that answer into REVIEW.
 """
 
 import re
 import secrets
 
-from traderbot.text import shown
+from traderbot.text import shown, visible_only
 
 NONCE_RE = re.compile(r"[0-9a-f]{32}")
 LABEL_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -58,7 +59,10 @@ def preamble(nonce: str) -> str:
 
 
 def verify_no_fence_leak(text: str, nonce: str) -> bool:
-    """True when `text` carries neither the nonce nor any fence tag."""
+    """True when `text` carries neither the nonce nor any fence tag, read as a reader sees it:
+    NFKC folded and with format and invisible characters removed, so a zero width space inside
+    a tag or the nonce does not hide it."""
     if not NONCE_RE.fullmatch(nonce):
         raise ValueError("a fence nonce is 32 lowercase hex characters")
-    return nonce not in text.lower() and TAG_RE.search(text) is None
+    seen = visible_only(text)
+    return nonce not in seen.lower() and TAG_RE.search(seen) is None

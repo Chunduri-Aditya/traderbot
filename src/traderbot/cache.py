@@ -1,8 +1,9 @@
 """A deterministic read through cache at $TRADERBOT_HOME/cache.sqlite, and the retry rule.
 
 `get_or_fetch` stores the fetcher's result as canonical JSON (sorted keys, ASCII, no NaN) with
-its sha256. A row whose body no longer matches its digest, or does not parse, or was stamped in
-the future, is a miss: it is fetched again and overwritten, never served. Writes take
+its sha256. A row whose body no longer matches its digest, or does not parse, or holds a NaN or
+an infinity (which Python's JSON reader would otherwise accept), or was stamped in the future,
+is a miss: it is fetched again and overwritten, never served. Writes take
 `BEGIN IMMEDIATE`; every statement binds its values. A hit and a miss return the same shape,
 because a miss returns the stored text parsed back, not the fetcher's own objects.
 
@@ -124,6 +125,10 @@ def _immediate(conn: sqlite3.Connection) -> Iterator[None]:
     conn.commit()
 
 
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"cached JSON holds {name}")
+
+
 def lookup(conn: sqlite3.Connection, namespace: str, key: str, now: datetime, ttl_s: int) -> Any:
     """The stored value, or None on a miss (absent, expired, future stamped, or corrupt)."""
     row = conn.execute(
@@ -140,8 +145,8 @@ def lookup(conn: sqlite3.Connection, namespace: str, key: str, now: datetime, tt
     if not 0 <= age <= ttl_s or _digest(body) != digest:
         return None
     try:
-        return json.loads(body)
-    except json.JSONDecodeError:
+        return json.loads(body, parse_constant=_no_constant)
+    except ValueError:  # JSONDecodeError included: corrupt, or a NaN or an infinity
         return None
 
 

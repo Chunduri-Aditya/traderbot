@@ -1,7 +1,10 @@
-"""Text that reaches a terminal or a prompt: `shown` escapes what could act or hide.
+"""Text that reaches a terminal or a prompt: `shown` escapes what could act or hide, and
+`visible_only` drops it, for checks that must see text the way a reader does.
 
 Its own module so the CLI (`cli.shown`) and the prompt fence share one rule without a cycle.
 """
+
+import unicodedata
 
 # Default ignorable code points that isprintable() passes (letters and marks that render as
 # nothing): the combining grapheme joiner, Hangul fillers, Khmer inherent vowels, Mongolian free
@@ -21,6 +24,12 @@ INVISIBLE = (
 def _invisible(ch: str) -> bool:
     point = ord(ch)
     return any(low <= point <= high for low, high in INVISIBLE)
+
+
+def visible_only(text: str) -> str:
+    """NFKC folded (fullwidth `＜` reads as `<`), with format (Cf) and invisible characters gone."""
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in folded if unicodedata.category(ch) != "Cf" and not _invisible(ch))
 
 
 def shown(text: str) -> str:
