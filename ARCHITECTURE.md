@@ -4,6 +4,9 @@ _How it is built. Committed. Update in the same commit as any change to the flow
 
 ## Flow
 - propose: kill switch check, `keychain` keys, `data` (calendar sets `as_of`, SIP daily RAW bars, both through `cache`; stale refuses), account snapshot (a tripped breaker refuses), a spend reservation of the $0.25 call cap, `desk` (one clean claude call in its own process group, schema only), the cost settled, `proposal` (code sizes qty and limit, buy or sell, sha256 digest, expiry at the next session close), `gate` (pure verdict), `ledger` (card row and an event).
+- settle: every buy or sell card with no settlement whose fifth session after `as_of` has closed on the exchange calendar: adjusted closes P0 (as_of) and P5, the same two SPY closes, raw return (a sell wins when the price falls), alpha in bps, `won = R > 0`, Brier on the desk's confidence; `fill` when its order filled any shares, else `counterfactual`. A bad or missing close skips the card with its reason. Settlement and score rows are written once, in one transaction.
+- score: offline; settled cards of the model desks only (code built cards are left out): win rate, mean return, mean alpha, mean Brier, paired percentile bootstrap CIs (1,000 resamples, `random.Random(42)`).
+- breaker input: the latest settled fills with `R <= 0` in a row, ordered by horizon close then card creation; 3 in a row trips `CIRCUIT_BREAKER` at the next propose or approve.
 - approve: the prefix is typed at `/dev/tty` (no terminal, no approval), then the `ledger` card, sha256 of the stored text checked against its key, a card denied at propose or rejected refused, `broker` lookup by client id (return it if found), else `gate` rerun on live account state against the signed `requested_symbol`, the card's order slot claimed in one transaction (one claim per card; the daily cap counts claims), the clock read once more, then a DAY limit order on the paper host unless the kill switch file exists; the approve decision is recorded only once an order exists, and a submit that raises leaves an unconfirmed claim that the next approve, reject or status looks up by client id.
 
 ## Stack
@@ -16,14 +19,15 @@ _How it is built. Committed. Update in the same commit as any change to the flow
 ## Layout
 - `src/traderbot/cli.py`: argparse commands and their readable output.
 - `src/traderbot/gate.py`: the only place a rule lives (fourteen reason codes); `Limits` holds Aditya's numbers until Phase 3.
-- `src/traderbot/ledger.py`: cards, orders, decisions, spend reservations, append only events, equity marks, settlements (written from Phase 4), the breaker latch, and the `OFF` kill switch file.
+- `src/traderbot/ledger.py`: cards, orders, decisions, spend reservations, append only events, equity marks, settlements with their `scores` row, the breaker latch, and the `OFF` kill switch file.
 - `scripts/check.sh`: ruff, ruff format, mypy strict and pytest, one labeled exit code each; `scripts/mutate.py`: breaks each gate rule and requires its named test to fail.
 - `src/traderbot/broker.py`: every trading client passes the paper host check here.
 - `src/traderbot/paths.py`: `TRADERBOT_HOME` at 0700, shared by the ledger and the cache.
 - `src/traderbot/cache.py`: `get_or_fetch` (canonical JSON with its sha256; a corrupt, expired or future stamped row is refetched, never served) and `retry_with_backoff` (3 attempts, transient errors only: timeouts, dropped connections, HTTP 429 and 5xx).
 - `src/traderbot/data.py`: the calendar (cached a day) and SIP daily closes. RAW closes size orders and feed the gate; `Adjustment.ALL` closes feed settlement, desk context and backtests, cached under the ET fetch date because a later split or dividend rewrites them. A window whose `as_of` bar is not served whole is never cached.
 - `src/traderbot/fundamentals.py`: EDGAR companyfacts; `point_in_time_facts` keeps only facts with `filed <= as_of` and `end <= as_of`, the latest period per field, `Decimal` values. `scripts/pit_check.py` proves it on a live fetch.
-- `src/traderbot/{fence,scoring,backtest,live_gate}.py`: loud stubs until their phase.
+- `src/traderbot/scoring.py`: pure settlement (`horizon_session`, `forward_return`, `settle`) and `score_summary`; the definitions in its docstring are the only ones.
+- `src/traderbot/{fence,backtest,live_gate}.py`: loud stubs until their phase.
 - `tests/test_smoke.py`: the live path in two halves, the real desk and a code built buy through approve (marked `live`, deselected by default). `tests/conftest.py` makes claude, the Keychain, every `requests` call, `urllib.request.urlopen` and the EDGAR reader tripwires in offline tests and points `TRADERBOT_HOME` at `tmp_path`.
 
 ## Boundaries
@@ -49,3 +53,5 @@ Ideas rebuilt in original code; nothing is pasted from `repos/` (OpenBB `develop
 | Circuit breaker on consecutive losses, halting on an invalid starting value | ECC `skills/llm-trading-agent-security/SKILL.md:92-110` (its regex injection denylist is not adopted) | MIT | 2 |
 | A fundamental counts only once filed: `filed <= as_of` on every EDGAR fact (here the latest filing by `as_of` wins, so a restatement shows from its own filing date) | tradingagents `dataflows/vendors/sec_edgar.py:147-185` (`audits/tradingagents.md:78`) | Apache 2.0 | 3 |
 | TTL cache that never serves a partial or stale window as fresh | osiris `sourceCache.ts` (`audits/COMPARISON.md`, worth rebuilding) | MIT | 3 |
+| Score a decision only after its holding window trades (deferred settlement) | tradingagents (`audits/COMPARISON.md`, worth rebuilding) | Apache 2.0 | 4 |
+| A Brier ledger scored against settled outcomes, never the model grading itself | osiris PYTHIA idea (`audits/COMPARISON.md`, worth rebuilding) | MIT | 4 |

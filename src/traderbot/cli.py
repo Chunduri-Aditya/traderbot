@@ -1,10 +1,13 @@
-"""traderbot: propose, approve (typed at the terminal), reject, status, off, on, reset-breaker.
+"""traderbot: propose, approve (typed at the terminal), reject, status, off, on, reset-breaker,
+settle and score.
 
 `propose` reads bars and refuses early (kill switch, stale bars, tripped breaker, spend cap)
 before any desk call; otherwise it reserves the call cap, asks the desk, settles the cost, sizes
 the order in code, runs the gate and stores a card. `approve` reads an 8 character prefix from
 /dev/tty, checks the card, returns an order already placed under its digest or reruns the gate
-live, records the first decision and submits. Every command takes --json.
+live, records the first decision and submits. `settle` scores every buy or sell card whose
+fifth session after as_of has closed (adjusted closes, SPY over the same window); `score` reads
+the settled desk cards back offline. Every command takes --json.
 """
 
 import argparse
@@ -21,10 +24,11 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, TextIO
 
+from alpaca.data.enums import Adjustment
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Order
 
-from traderbot import broker, data, desk, gate, keychain, ledger
+from traderbot import broker, data, desk, gate, keychain, ledger, scoring
 from traderbot import proposal as prop
 
 SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:\.[A-Z]{1,2})?")
@@ -377,6 +381,105 @@ def status() -> dict[str, Any]:
     }
 
 
+def settle() -> dict[str, Any]:
+    """Settle every buy or sell card whose horizon has closed; keys are read only if one waits."""
+    conn = ledger.connect()
+    now = data.now_et()
+    pending = ledger.unsettled(conn)
+    settled: list[dict[str, Any]] = []
+    waiting: list[str] = []
+    skipped: list[dict[str, str]] = []
+    if pending:
+        keys = keychain.load()
+        trading = broker.client(keys)
+        start = min(card.proposal.as_of for card in pending)
+        calendar = data.cached_sessions(trading, start, now.date(), now)
+        as_of = data.last_closed(calendar, now)
+        series: dict[str, dict[date, Decimal]] = {}
+
+        def closes(symbol: str) -> dict[date, Decimal]:
+            if symbol not in series:
+                series[symbol] = dict(data.history(keys, symbol, start, as_of, now, Adjustment.ALL))
+            return series[symbol]
+
+        for card in pending:
+            short = card.digest[:PREFIX_LEN]
+            p = card.proposal
+            try:
+                if not SYMBOL_RE.fullmatch(p.symbol):
+                    raise ValueError(f"card symbol {p.symbol!r} is not a US stock or ETF symbol")
+                if scoring.horizon_session(calendar, p.as_of, now) is None:
+                    waiting.append(short)
+                    continue
+                kind = ledger.settlement_kind(card)
+                result = scoring.settle(
+                    p, card.digest, kind, calendar, closes(p.symbol), closes(scoring.BENCHMARK), now
+                )
+            except ValueError as err:
+                skipped.append({"digest": short, "reason": str(err)})
+                continue
+            if result is None:
+                waiting.append(short)
+            elif ledger.record_settlement(conn, result):
+                view = settlement_view(result)
+                ledger.log_event(conn, "settle", now, card.digest, view)
+                settled.append(view)
+    return {"settled": settled, "waiting": waiting, "skipped": skipped}
+
+
+def settlement_view(s: scoring.Settlement) -> dict[str, Any]:
+    return {
+        "digest": s.digest,
+        "symbol": s.symbol,
+        "side": s.side,
+        "desk": s.desk,
+        "kind": s.kind,
+        "as_of": s.as_of.isoformat(),
+        "horizon_end": s.horizon_end.isoformat(),
+        "raw_return": str(s.raw_return),
+        "spy_return": str(s.spy_return),
+        "alpha_bps": str(s.alpha_bps),
+        "confidence": str(s.confidence),
+        "won": s.won,
+        "brier": str(s.brier),
+    }
+
+
+def _opt(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _ci(pair: tuple[Decimal, Decimal] | None) -> list[str] | None:
+    return None if pair is None else [str(pair[0]), str(pair[1])]
+
+
+def report_view(report: scoring.ScoreReport) -> dict[str, Any]:
+    return {
+        "settled": report.settled,
+        "win_rate": _opt(report.win_rate),
+        "mean_return": _opt(report.mean_return),
+        "mean_alpha_bps": _opt(report.mean_alpha_bps),
+        "mean_brier": _opt(report.mean_brier),
+        "alpha_ci_bps": _ci(report.alpha_ci),
+        "brier_ci": _ci(report.brier_ci),
+        "seed": report.seed,
+        "resamples": report.resamples,
+    }
+
+
+def desk_report(conn: sqlite3.Connection) -> scoring.ScoreReport:
+    """The model desks' record: settled desk cards only, code built cards left out."""
+    return scoring.score_summary(scoring.scorable(ledger.settlements(conn)))
+
+
+def score() -> dict[str, Any]:
+    return report_view(desk_report(ledger.connect()))
+
+
+def _q(raw: str | None, places: str = "0.01") -> str:
+    return "n/a" if raw is None else str(Decimal(raw).quantize(Decimal(places)))
+
+
 def card_view(card: ledger.Card) -> dict[str, Any]:
     """A card as plain JSON values; model text stays raw here and is escaped by json.dumps."""
     p = card.proposal
@@ -441,6 +544,33 @@ def _readable(command: str, view: dict[str, Any]) -> list[str]:
         return [f"kill switch {'on: nothing is submitted' if view['kill_switch'] else 'off'}"]
     if command == "reset-breaker":
         return [f"circuit breaker trips cleared: {view['reset']}"]
+    if command == "settle":
+        lines = [
+            (
+                f"settled {len(view['settled'])}  waiting {len(view['waiting'])}"
+                f"  skipped {len(view['skipped'])}"
+            )
+        ]
+        lines += [
+            (
+                f"{row['digest'][:PREFIX_LEN]}  {shown(row['symbol'])} {row['side']} {row['kind']}"
+                f"  return {_q(row['raw_return'], '0.0001')}  alpha {_q(row['alpha_bps'])} bps"
+                f"  {'won' if row['won'] else 'lost'}  brier {_q(row['brier'], '0.0001')}"
+            )
+            for row in view["settled"]
+        ]
+        lines += [f"skipped {row['digest']}: {shown(row['reason'])}" for row in view["skipped"]]
+        return lines
+    if command == "score":
+        ci = view["alpha_ci_bps"]
+        return [
+            (
+                f"desk score  settled {view['settled']}  win rate {_q(view['win_rate'])}"
+                f"  mean alpha {_q(view['mean_alpha_bps'])} bps"
+                f" (95% CI {_q(ci[0]) if ci else 'n/a'} to {_q(ci[1]) if ci else 'n/a'})"
+                f"  mean brier {_q(view['mean_brier'], '0.0001')}"
+            )
+        ]
     header = (
         f"traderbot status  cards {len(view['cards'])}  spend {view['day']}"
         f" ${Decimal(view['spend_usd']).quantize(Decimal('0.0001'))} of ${view['cap_usd']}"
@@ -472,6 +602,10 @@ def _run(command: str, args: argparse.Namespace) -> dict[str, Any]:
         return {"kill_switch": ledger.kill_switch_on()}
     if command == "reset-breaker":
         return {"reset": reset_breaker_at_terminal()}
+    if command == "settle":
+        return settle()
+    if command == "score":
+        return score()
     return status()
 
 
@@ -486,6 +620,8 @@ def main(argv: list[str] | None = None) -> int:
         "off": "turn the kill switch on: nothing is submitted",
         "on": "turn the kill switch off",
         "reset-breaker": "clear a tripped circuit breaker, typed at the terminal",
+        "settle": "score buy and sell cards five sessions after their as_of close",
+        "score": "the desk's settled record: win rate, alpha against SPY, Brier, bootstrap CIs",
     }
     parsers = {name: sub.add_parser(name, help=text) for name, text in commands.items()}
     parsers["propose"].add_argument("symbol")

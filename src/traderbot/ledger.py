@@ -4,7 +4,9 @@
 against its key, so an edited row no longer matches. `orders` maps a card to its Alpaca order,
 `decisions` holds the first approve or reject per card (a primary key, so a second one fails),
 `spend` holds claude reservations until they settle, and `events` is append only by trigger.
-`equity_marks`, `settlements` and `breaker` feed the circuit breaker.
+`equity_marks`, `settlements` and `breaker` feed the circuit breaker. `scores` holds each
+settlement's prices, returns, alpha and Brier (Phase 4); a settlement and its score row are
+written in one transaction and never rewritten.
 """
 
 import json
@@ -18,7 +20,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from traderbot import paths
+from traderbot import paths, scoring
 from traderbot import proposal as prop
 from traderbot.gate import Deny, GateResult
 
@@ -81,6 +83,23 @@ CREATE TABLE IF NOT EXISTS settlements (
     kind TEXT NOT NULL CHECK (kind IN ('fill', 'counterfactual')),
     settled_at TEXT NOT NULL,
     raw_return TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scores (
+    digest TEXT PRIMARY KEY REFERENCES settlements(digest),
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+    desk TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    horizon_end TEXT NOT NULL,
+    p0 TEXT NOT NULL,
+    p5 TEXT NOT NULL,
+    spy0 TEXT NOT NULL,
+    spy5 TEXT NOT NULL,
+    spy_return TEXT NOT NULL,
+    alpha_bps TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    won INTEGER NOT NULL CHECK (won IN (0, 1)),
+    brier TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS breaker (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -491,18 +510,136 @@ def _last_reset(conn: sqlite3.Connection) -> datetime | None:
 
 
 def consecutive_losses(conn: sqlite3.Connection) -> int:
-    """Latest settled fills with a negative raw return, in a row (Phase 4 writes settlements)."""
+    """Latest settled fills that did not win (raw return <= 0, the inverse of `won`), in a row.
+
+    Chronological by when the outcome was known (the horizon close), then by card creation, so
+    a batch settled in one run still counts in trading order.
+    """
     since = _last_reset(conn)
-    rows = conn.execute("SELECT settled_at, raw_return FROM settlements WHERE kind = 'fill'")
-    stamped = [(datetime.fromisoformat(at), ret) for at, ret in rows.fetchall()]
-    after = [(at, ret) for at, ret in stamped if since is None or at > since]
-    newest_first = sorted(after, key=lambda row: row[0], reverse=True)
+    rows = conn.execute(
+        "SELECT s.settled_at, c.created_at, s.raw_return FROM settlements s"
+        " JOIN cards c ON c.digest = s.digest WHERE s.kind = 'fill'"
+    )
+    stamped = [
+        (datetime.fromisoformat(at), datetime.fromisoformat(created), ret)
+        for at, created, ret in rows.fetchall()
+    ]
+    after = [row for row in stamped if since is None or row[0] > since]
+    newest_first = sorted(after, key=lambda row: (row[0], row[1]), reverse=True)
     streak = 0
-    for _, raw_return in newest_first:
-        if Decimal(raw_return) >= 0:
+    for _, _, raw_return in newest_first:
+        if Decimal(raw_return) > 0:
             break
         streak += 1
     return streak
+
+
+def unsettled(conn: sqlite3.Connection) -> list[Card]:
+    """Buy and sell cards with no settlement yet, oldest first."""
+    rows = conn.execute(
+        f"{_SELECT} WHERE c.side IN ('buy', 'sell')"
+        " AND c.digest NOT IN (SELECT digest FROM settlements) ORDER BY c.created_at"
+    )
+    return [_card(row) for row in rows.fetchall()]
+
+
+def settlement_kind(card: Card) -> str:
+    """`fill` once the card's order filled any shares, else `counterfactual`."""
+    try:
+        filled = Decimal(card.filled_qty) if card.filled_qty else Decimal(0)
+    except ArithmeticError:
+        filled = Decimal(0)
+    return "fill" if filled.is_finite() and filled > 0 else "counterfactual"
+
+
+def record_settlement(conn: sqlite3.Connection, s: scoring.Settlement) -> bool:
+    """Write the settlement and its score once; False if the card was already settled."""
+    with _immediate(conn):
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO settlements VALUES (?, ?, ?, ?)",
+            (s.digest, s.kind, s.settled_at.isoformat(), str(s.raw_return)),
+        )
+        if cursor.rowcount == 0:
+            return False
+        conn.execute(
+            "INSERT INTO scores VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                s.digest,
+                s.symbol,
+                s.side,
+                s.desk,
+                s.as_of.isoformat(),
+                s.horizon_end.isoformat(),
+                str(s.p0),
+                str(s.p5),
+                str(s.spy0),
+                str(s.spy5),
+                str(s.spy_return),
+                str(s.alpha_bps),
+                str(s.confidence),
+                int(s.won),
+                str(s.brier),
+            ),
+        )
+    return True
+
+
+def settlements(conn: sqlite3.Connection) -> list[scoring.Settlement]:
+    """Every scored settlement, in the order outcomes became known."""
+    rows = conn.execute(
+        "SELECT s.digest, sc.symbol, sc.side, sc.desk, s.kind, sc.as_of, sc.horizon_end,"
+        " s.settled_at, sc.p0, sc.p5, sc.spy0, sc.spy5, s.raw_return, sc.spy_return,"
+        " sc.alpha_bps, sc.confidence, sc.won, sc.brier"
+        " FROM settlements s JOIN scores sc ON sc.digest = s.digest ORDER BY s.settled_at, s.digest"
+    )
+    return [
+        scoring.Settlement(
+            digest=digest,
+            symbol=symbol,
+            side=side,
+            desk=desk,
+            kind=kind,
+            as_of=date.fromisoformat(as_of),
+            horizon_end=date.fromisoformat(horizon_end),
+            settled_at=datetime.fromisoformat(settled_at),
+            p0=Decimal(p0),
+            p5=Decimal(p5),
+            spy0=Decimal(spy0),
+            spy5=Decimal(spy5),
+            raw_return=Decimal(raw),
+            spy_return=Decimal(spy_return),
+            alpha_bps=Decimal(alpha),
+            confidence=Decimal(confidence),
+            won=bool(won),
+            brier=Decimal(brier),
+        )
+        for (
+            digest,
+            symbol,
+            side,
+            desk,
+            kind,
+            as_of,
+            horizon_end,
+            settled_at,
+            p0,
+            p5,
+            spy0,
+            spy5,
+            raw,
+            spy_return,
+            alpha,
+            confidence,
+            won,
+            brier,
+        ) in rows.fetchall()
+    ]
+
+
+def unconfirmed_claims(conn: sqlite3.Connection) -> int:
+    """Order slots claimed with no Alpaca order id recorded: in flight, failed or crashed."""
+    (count,) = conn.execute("SELECT count(*) FROM orders WHERE order_id = ''").fetchone()
+    return int(count)
 
 
 def breaker_latched(conn: sqlite3.Connection) -> bool:

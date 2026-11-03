@@ -25,7 +25,8 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 - [x] `scripts/pit_check.py` on a live fetch (cloud session, 2026-11-03): AAPL CIK 320193 at `as_of` 2026-11-02 chose the Q3 10-Q filed 2026-07-31 and none of the 463 facts the FY2026 10-K filed 2026-11-03 carries; `chosen=6 leaked=0`, exit 0.
 
 ## Phase 4: scoring and memory
-- [ ] Settlement after 5 sessions, alpha against SPY, Brier, bootstrap CI; report equals hand computed values.
+- [x] `traderbot settle` and `traderbot score` (`--json` on both): settlement 5 exchange sessions after `as_of` on adjusted closes, alpha against SPY over the same closes, Brier, a seeded paired bootstrap CI; `tests/test_scoring.py` checks hand computed values (buy +3% against SPY +1% is 200 bps, Brier 0.09), a holiday inside the horizon, 4 sessions not settling, and 3 settled losing fills tripping `CIRCUIT_BREAKER`.
+- [ ] A live `settle` on the real ledger once a card is 5 sessions old (Aditya's Mac: needs the Keychain).
 
 ## Phase 5: desk
 - [ ] Nonce fence, seven role full desk, REVIEW on any role failure or budget stop; a live full desk card.
