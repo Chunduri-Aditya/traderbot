@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS scores (
     won INTEGER NOT NULL CHECK (won IN (0, 1)),
     brier TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS backtests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    report_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS breaker (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tripped_at TEXT NOT NULL,
@@ -634,6 +642,38 @@ def settlements(conn: sqlite3.Connection) -> list[scoring.Settlement]:
             brier,
         ) in rows.fetchall()
     ]
+
+
+def record_backtest(
+    conn: sqlite3.Connection,
+    now: datetime,
+    symbol: str,
+    strategy: str,
+    summary: scoring.ScoreReport,
+    report: dict[str, Any],
+) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO backtests (created_at, symbol, strategy, summary_json, report_json)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                now.isoformat(),
+                symbol,
+                strategy,
+                json.dumps(scoring.report_json(summary), sort_keys=True),
+                json.dumps(report, sort_keys=True, ensure_ascii=True),
+            ),
+        )
+
+
+def latest_baseline(conn: sqlite3.Connection, strategy: str) -> scoring.ScoreReport | None:
+    """The settled summary of the newest backtest of `strategy`, or None if none was run."""
+    row = conn.execute(
+        "SELECT summary_json FROM backtests WHERE strategy = ? ORDER BY created_at DESC, id DESC"
+        " LIMIT 1",
+        (strategy,),
+    ).fetchone()
+    return None if row is None else scoring.report_from_json(json.loads(row[0]))
 
 
 def unconfirmed_claims(conn: sqlite3.Connection) -> int:

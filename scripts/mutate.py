@@ -1,11 +1,13 @@
 """Break each gate rule in turn and require its named test to fail.
 
-Rows are written out here from the spec's reason codes, never derived from gate.py, so a rule
-the code never wrote shows up as an ERROR row instead of vanishing. Each row asserts its text
-occurs exactly once, applies the change, confirms it landed on disk, runs tests/test_gate.py,
-and counts as RED only when pytest exits 1 with the row's named test among the failures. Exit
-2 or 5 is an ERROR row. gate.py is restored by copy from the scratch directory after every row
-and at exit, and must match HEAD afterwards (`git diff --quiet`).
+Two targets: the order gate (`gate.py`, against tests/test_gate.py) and the live readiness gate
+(`live_gate.py`, against tests/test_live_gate.py). Rows are written out here from the spec's
+reason codes, never derived from the code, so a rule the code never wrote shows up as an ERROR
+row instead of vanishing. Each row asserts its text occurs exactly once, applies the change,
+confirms it landed on disk, runs its target's test file, and counts as RED only when pytest
+exits 1 with the row's named test among the failures. Exit 2 or 5 is an ERROR row. Each target
+is restored by copy from the scratch directory after every row and at exit, and must match HEAD
+afterwards (`git diff --quiet`).
 
 Usage: uv run python scripts/mutate.py --scratch <dir>
 """
@@ -19,8 +21,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-GATE = ROOT / "src" / "traderbot" / "gate.py"
 GATE_REL = "src/traderbot/gate.py"
+LIVE_REL = "src/traderbot/live_gate.py"
 
 
 def off(code: str) -> tuple[str, str]:
@@ -132,16 +134,90 @@ ROWS: list[tuple[str, str, str, str]] = [
 ]
 
 
-def run_row(original: str, old: str, new: str, test: str, pycache: Path) -> tuple[str, str]:
+def live_off(code: str) -> tuple[str, str]:
+    return f'reasons.append("{code}")', "pass"
+
+
+LIVE_ROWS: list[tuple[str, str, str, str]] = [
+    (
+        "INSUFFICIENT_SETTLEMENTS",
+        *live_off("INSUFFICIENT_SETTLEMENTS"),
+        "test_insufficient_settlements_deny",
+    ),
+    ("NEGATIVE_ALPHA_CI", *live_off("NEGATIVE_ALPHA_CI"), "test_negative_alpha_ci_deny"),
+    ("BRIER_OVER_MAX", *live_off("BRIER_OVER_MAX"), "test_brier_over_max_deny"),
+    ("NO_BASELINE", *live_off("NO_BASELINE"), "test_no_baseline_deny"),
+    (
+        "UNDERPERFORMS_BASELINE",
+        *live_off("UNDERPERFORMS_BASELINE"),
+        "test_underperforms_baseline_deny",
+    ),
+    ("BREAKER_LATCHED", *live_off("BREAKER_LATCHED"), "test_breaker_latched_deny"),
+    ("KILL_SWITCH_ACTIVE", *live_off("KILL_SWITCH_ACTIVE"), "test_kill_switch_active_deny"),
+    ("UNCONFIRMED_ORDERS", *live_off("UNCONFIRMED_ORDERS"), "test_unconfirmed_orders_deny"),
+    (
+        "live boundary: 20 settlements are enough",
+        "if score.settled < limits.min_settlements:",
+        "if score.settled <= limits.min_settlements:",
+        "test_allow_at_every_boundary",
+    ),
+    (
+        "live boundary: a lower CI bound of exactly 0 passes",
+        "score.alpha_ci[0] < limits.min_alpha_ci_low_bps",
+        "score.alpha_ci[0] <= limits.min_alpha_ci_low_bps",
+        "test_allow_at_every_boundary",
+    ),
+    (
+        "live boundary: a Brier of exactly 0.25 passes",
+        "score.mean_brier > limits.max_brier",
+        "score.mean_brier >= limits.max_brier",
+        "test_allow_at_every_boundary",
+    ),
+    (
+        "live boundary: alpha equal to the baseline passes",
+        "score.mean_alpha_bps < baseline.mean_alpha_bps",
+        "score.mean_alpha_bps <= baseline.mean_alpha_bps",
+        "test_allow_at_every_boundary",
+    ),
+    (
+        "live fail closed: no CI is a deny",
+        "if score.alpha_ci is None or score.alpha_ci[0]",
+        "if score.alpha_ci is not None and score.alpha_ci[0]",
+        "test_negative_alpha_ci_deny_without_a_ci",
+    ),
+    (
+        "live fail closed: no Brier is a deny",
+        "if score.mean_brier is None or score.mean_brier",
+        "if score.mean_brier is not None and score.mean_brier",
+        "test_brier_over_max_deny_without_a_brier",
+    ),
+]
+
+# (target file, its test file, its rows)
+TARGETS: list[tuple[str, str, list[tuple[str, str, str, str]]]] = [
+    (GATE_REL, "tests/test_gate.py", ROWS),
+    (LIVE_REL, "tests/test_live_gate.py", LIVE_ROWS),
+]
+
+
+def run_row(
+    target: Path,
+    test_file: str,
+    original: str,
+    old: str,
+    new: str,
+    test: str,
+    pycache: Path,
+) -> tuple[str, str]:
     count = original.count(old)
     if count != 1:
         return "ERROR", f"rule text found {count} times, want 1"
     mutated = original.replace(old, new)
-    GATE.write_text(mutated)
-    if GATE.read_text() != mutated or mutated == original:
+    target.write_text(mutated)
+    if target.read_text() != mutated or mutated == original:
         return "ERROR", "the mutation did not land on disk"
     proc = subprocess.run(
-        ["uv", "run", "pytest", "tests/test_gate.py", "-q", "-rf", "-p", "no:cacheprovider"],
+        ["uv", "run", "pytest", test_file, "-q", "-rf", "-p", "no:cacheprovider"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -152,7 +228,7 @@ def run_row(original: str, old: str, new: str, test: str, pycache: Path) -> tupl
         env={**os.environ, "COLUMNS": "10000", "PYTHONPYCACHEPREFIX": str(pycache)},
     )
     named = re.search(
-        rf"^FAILED tests/test_gate\.py::{re.escape(test)}( |$)", proc.stdout, re.MULTILINE
+        rf"^FAILED {re.escape(test_file)}::{re.escape(test)}( |$)", proc.stdout, re.MULTILINE
     )
     if proc.returncode == 1 and named:
         return "RED", f"{test} failed"
@@ -163,35 +239,48 @@ def run_row(original: str, old: str, new: str, test: str, pycache: Path) -> tupl
     return "ERROR", f"pytest exit {proc.returncode}"
 
 
+def _clean(rel: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(ROOT), "diff", "--quiet", "--", rel], check=False
+        ).returncode
+        == 0
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--scratch", required=True, help="where gate.py is copied before mutating")
+    parser.add_argument("--scratch", required=True, help="where each target is copied first")
     args = parser.parse_args()
-    head = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", "--", GATE_REL], check=False)
-    if head.returncode != 0:
-        print(f"{GATE_REL} differs from HEAD; commit it before mutating", file=sys.stderr)
-        return 2
+    for rel, _, _ in TARGETS:
+        if not _clean(rel):
+            print(f"{rel} differs from HEAD; commit it before mutating", file=sys.stderr)
+            return 2
     scratch = Path(args.scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    backup = scratch / "gate.py.orig"
-    shutil.copyfile(GATE, backup)
-    original = backup.read_text()
     results: list[tuple[str, str, str]] = []
-    try:
-        for index, (name, old, new, test) in enumerate(ROWS):
-            verdict, note = run_row(original, old, new, test, scratch / f"pycache-{index}")
-            shutil.copyfile(backup, GATE)
-            results.append((verdict, name, note))
-            print(f"{verdict:5}  {name}: {note}", flush=True)
-    finally:
-        shutil.copyfile(backup, GATE)
-    clean = subprocess.run(
-        ["git", "-C", str(ROOT), "diff", "--quiet", "--", GATE_REL], check=False
-    ).returncode
+    index = 0
+    for rel, test_file, rows in TARGETS:
+        target = ROOT / rel
+        backup = scratch / f"{target.name}.orig"
+        shutil.copyfile(target, backup)
+        original = backup.read_text()
+        try:
+            for name, old, new, test in rows:
+                verdict, note = run_row(
+                    target, test_file, original, old, new, test, scratch / f"pycache-{index}"
+                )
+                index += 1
+                shutil.copyfile(backup, target)
+                results.append((verdict, name, note))
+                print(f"{verdict:5}  {name}: {note}", flush=True)
+        finally:
+            shutil.copyfile(backup, target)
+    clean = all(_clean(rel) for rel, _, _ in TARGETS)
     red = sum(verdict == "RED" for verdict, _, _ in results)
     print(f"rows={len(results)} red={red} not_red={len(results) - red}")
-    print(f"gate_restored={'clean' if clean == 0 else 'DIRTY'}")
-    return 0 if red == len(results) and clean == 0 else 1
+    print(f"gate_restored={'clean' if clean else 'DIRTY'}")
+    return 0 if red == len(results) and clean else 1
 
 
 if __name__ == "__main__":

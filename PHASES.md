@@ -33,7 +33,9 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 - [ ] A live full desk card (Aditya's Mac: needs the Keychain and the claude CLI).
 
 ## Phase 6: baseline and live check
-- [ ] Rules baseline backtest equals hand values; `live-check` prints FAIL with reasons on a young ledger.
+- [x] `traderbot backtest SYMBOL` (`sma`, `mean_rev`) through `proposal.size`, `gate.check` and `scoring.settle`; `tests/test_backtest.py` equals hand values (the SMA cross buys 9 at 110.55 on bar 30 for 900 bps; mean reversion buys 12 at 80.40 and sells 10 then 2 at 99.50), no decision moves when later bars change, and the breaker stops a baseline after 3 settled losses.
+- [x] `traderbot live-check` prints `FAIL: INSUFFICIENT_SETTLEMENTS, NEGATIVE_ALPHA_CI, BRIER_OVER_MAX, NO_BASELINE` on a young ledger and exits 1 (`test_live_check_fails_on_a_young_ledger_and_exits_one`); each of the eight codes has a deny and an allow on its limit, with mutation rows.
+- [ ] A live `backtest SPY` and `live-check` on the real ledger (Aditya's Mac: needs the Keychain).
 
 ## Phase 7: Fable audit
 - [ ] Four fresh Fable reviewers; findings in `audits/traderbot-fable-audit.md`; fixes land with failing tests first.

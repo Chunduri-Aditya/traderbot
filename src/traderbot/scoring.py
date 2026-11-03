@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from traderbot.data import Session
 from traderbot.proposal import Proposal
@@ -196,6 +197,51 @@ def score_summary(
         brier_ci=percentile_ci(brier_means),
         seed=seed,
         resamples=resamples,
+    )
+
+
+def _opt(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _ci(pair: tuple[Decimal, Decimal] | None) -> list[str] | None:
+    return None if pair is None else [str(pair[0]), str(pair[1])]
+
+
+def report_json(report: ScoreReport) -> dict[str, Any]:
+    """A report as plain JSON values; Decimals as strings, so nothing rounds on the way."""
+    return {
+        "settled": report.settled,
+        "win_rate": _opt(report.win_rate),
+        "mean_return": _opt(report.mean_return),
+        "mean_alpha_bps": _opt(report.mean_alpha_bps),
+        "mean_brier": _opt(report.mean_brier),
+        "alpha_ci_bps": _ci(report.alpha_ci),
+        "brier_ci": _ci(report.brier_ci),
+        "seed": report.seed,
+        "resamples": report.resamples,
+    }
+
+
+def _dec(raw: Any) -> Decimal | None:
+    return None if raw is None else Decimal(str(raw))
+
+
+def _pair(raw: Any) -> tuple[Decimal, Decimal] | None:
+    return None if raw is None else (Decimal(str(raw[0])), Decimal(str(raw[1])))
+
+
+def report_from_json(raw: dict[str, Any]) -> ScoreReport:
+    return ScoreReport(
+        settled=int(raw["settled"]),
+        win_rate=_dec(raw["win_rate"]),
+        mean_return=_dec(raw["mean_return"]),
+        mean_alpha_bps=_dec(raw["mean_alpha_bps"]),
+        mean_brier=_dec(raw["mean_brier"]),
+        alpha_ci=_pair(raw["alpha_ci_bps"]),
+        brier_ci=_pair(raw["brier_ci"]),
+        seed=int(raw["seed"]),
+        resamples=int(raw["resamples"]),
     )
 
 

@@ -1,5 +1,5 @@
 """traderbot: propose, approve (typed at the terminal), reject, status, off, on, reset-breaker,
-settle and score.
+settle, score, backtest and live-check.
 
 `propose` reads bars and refuses early (kill switch, stale bars, tripped breaker, spend cap)
 before any desk call; otherwise it reserves the call cap, asks the desk, settles the cost, sizes
@@ -7,7 +7,10 @@ the order in code, runs the gate and stores a card. `approve` reads an 8 charact
 /dev/tty, checks the card, returns an order already placed under its digest or reruns the gate
 live, records the first decision and submits. `settle` scores every buy or sell card whose
 fifth session after as_of has closed (adjusted closes, SPY over the same window); `score` reads
-the settled desk cards back offline. Every command takes --json.
+the settled desk cards back offline. `backtest` walks a rules baseline over adjusted history
+through the same sizing, gate and settlement, and stores its summary; `live-check` compares the
+desk's record with the latest `sma` baseline offline and exits 1 on FAIL. Every command takes
+--json.
 """
 
 import argparse
@@ -28,7 +31,19 @@ from alpaca.data.enums import Adjustment
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Order
 
-from traderbot import broker, data, desk, fundamentals, gate, keychain, ledger, scoring, text
+from traderbot import (
+    backtest,
+    broker,
+    data,
+    desk,
+    fundamentals,
+    gate,
+    keychain,
+    ledger,
+    live_gate,
+    scoring,
+    text,
+)
 from traderbot import proposal as prop
 
 SYMBOL_RE = re.compile(r"[A-Z]{1,5}(?:\.[A-Z]{1,2})?")
@@ -36,6 +51,9 @@ PREFIX_LEN = 8
 TYPED_PREFIX_RE = re.compile(r"[0-9a-f]{8}")
 TTY = "/dev/tty"
 LIMITS = gate.Limits()
+LIVE_LIMITS = live_gate.LiveLimits()
+BASELINE = "sma"  # the baseline live-check compares the desk against
+BACKTEST_DAYS = 730
 shown = text.shown  # cli.shown: the one escape for model and user text
 
 
@@ -428,26 +446,8 @@ def settlement_view(s: scoring.Settlement) -> dict[str, Any]:
     }
 
 
-def _opt(value: Decimal | None) -> str | None:
-    return None if value is None else str(value)
-
-
-def _ci(pair: tuple[Decimal, Decimal] | None) -> list[str] | None:
-    return None if pair is None else [str(pair[0]), str(pair[1])]
-
-
 def report_view(report: scoring.ScoreReport) -> dict[str, Any]:
-    return {
-        "settled": report.settled,
-        "win_rate": _opt(report.win_rate),
-        "mean_return": _opt(report.mean_return),
-        "mean_alpha_bps": _opt(report.mean_alpha_bps),
-        "mean_brier": _opt(report.mean_brier),
-        "alpha_ci_bps": _ci(report.alpha_ci),
-        "brier_ci": _ci(report.brier_ci),
-        "seed": report.seed,
-        "resamples": report.resamples,
-    }
+    return scoring.report_json(report)
 
 
 def desk_report(conn: sqlite3.Connection) -> scoring.ScoreReport:
@@ -457,6 +457,73 @@ def desk_report(conn: sqlite3.Connection) -> scoring.ScoreReport:
 
 def score() -> dict[str, Any]:
     return report_view(desk_report(ledger.connect()))
+
+
+def run_backtest(raw_symbol: str, strategy: str, days: int = BACKTEST_DAYS) -> dict[str, Any]:
+    """A baseline over adjusted history up to the last closed session; its summary is stored."""
+    symbol = _symbol(raw_symbol)
+    if strategy not in backtest.STRATEGIES:
+        raise Refused(f"strategy is one of {', '.join(backtest.STRATEGIES)}: {shown(strategy)}")
+    if not 60 <= days <= 3650:
+        raise Refused(f"a backtest covers 60 to 3650 calendar days, got {days}")
+    now = data.now_et()
+    conn = ledger.connect()
+    keys = keychain.load()
+    trading = broker.client(keys)
+    start = now.date() - timedelta(days=days)
+    calendar = data.cached_sessions(trading, start, now.date(), now)
+    as_of = data.last_closed(calendar, now)
+    closes = data.history(keys, symbol, start, as_of, now, Adjustment.ALL)
+    spy = dict(data.history(keys, scoring.BENCHMARK, start, as_of, now, Adjustment.ALL))
+    try:
+        report = backtest.run(symbol, closes, spy, backtest.STRATEGIES[strategy], LIMITS)
+    except ValueError as err:
+        raise Refused(f"backtest of {symbol} refused: {err}") from err
+    view = backtest_view(report)
+    ledger.record_backtest(conn, now, symbol, strategy, report.summary, view)
+    ledger.log_event(conn, "backtest", now, details={"symbol": symbol, "strategy": strategy})
+    return view
+
+
+def backtest_view(r: backtest.BacktestReport) -> dict[str, Any]:
+    return {
+        "symbol": r.symbol,
+        "strategy": r.strategy,
+        "desk": r.desk_label,
+        "start": r.start.isoformat(),
+        "end": r.end.isoformat(),
+        "bars": r.bars,
+        "signals": r.signals,
+        "allowed": r.allowed,
+        "denied": r.denied,
+        "deny_reasons": dict(r.deny_reasons),
+        "open_orders": r.open_orders,
+        "final_equity": str(r.final_equity),
+        "buy_and_hold_return": str(r.buy_and_hold_return),
+        "spy_return": None if r.spy_return is None else str(r.spy_return),
+        "summary": scoring.report_json(r.summary),
+    }
+
+
+def live_check() -> dict[str, Any]:
+    """Offline: the desk's settled record, the ledger state and the latest baseline."""
+    conn = ledger.connect()
+    report = desk_report(conn)
+    state = live_gate.LiveState(
+        kill_switch=ledger.kill_switch_on(),
+        breaker_latched=ledger.breaker_latched(conn),
+        unconfirmed_orders=ledger.unconfirmed_claims(conn),
+    )
+    baseline = ledger.latest_baseline(conn, BASELINE)
+    verdict = live_gate.check_live_readiness(report, state, baseline, LIVE_LIMITS)
+    return {
+        "passed": verdict.passed,
+        "reasons": list(verdict.reasons),
+        "desk": scoring.report_json(report),
+        "baseline": None if baseline is None else scoring.report_json(baseline),
+        "min_settlements": LIVE_LIMITS.min_settlements,
+        "max_brier": str(LIVE_LIMITS.max_brier),
+    }
 
 
 def _q(raw: str | None, places: str = "0.01") -> str:
@@ -554,6 +621,35 @@ def _readable(command: str, view: dict[str, Any]) -> list[str]:
                 f"  mean brier {_q(view['mean_brier'], '0.0001')}"
             )
         ]
+    if command == "backtest":
+        summary = view["summary"]
+        denied = ", ".join(f"{code} {n}" for code, n in view["deny_reasons"].items()) or "none"
+        return [
+            (
+                f"backtest {view['symbol']} {view['strategy']}  {view['start']} to {view['end']}"
+                f"  bars {view['bars']}  signals {view['signals']}  allowed {view['allowed']}"
+                f"  denied {view['denied']}  open {view['open_orders']}"
+            ),
+            (
+                f"settled {summary['settled']}  win rate {_q(summary['win_rate'])}"
+                f"  mean alpha {_q(summary['mean_alpha_bps'])} bps"
+                f"  buy and hold {_q(view['buy_and_hold_return'], '0.0001')}"
+                f"  SPY {_q(view['spy_return'], '0.0001')}"
+            ),
+            f"denials: {denied}",
+        ]
+    if command == "live-check":
+        verdict = "PASS" if view["passed"] else "FAIL: " + ", ".join(view["reasons"])
+        return [
+            f"live-check {verdict}",
+            (
+                f"desk settled {view['desk']['settled']} of {view['min_settlements']} needed"
+                f"  mean alpha {_q(view['desk']['mean_alpha_bps'])} bps"
+                f"  baseline {_q(view['baseline']['mean_alpha_bps']) if view['baseline'] else 'none'}"
+                " bps"
+            ),
+            "no live code path exists; going live needs a separate plan Aditya approves",
+        ]
     header = (
         f"traderbot status  cards {len(view['cards'])}  spend {view['day']}"
         f" ${Decimal(view['spend_usd']).quantize(Decimal('0.0001'))} of ${view['cap_usd']}"
@@ -589,6 +685,10 @@ def _run(command: str, args: argparse.Namespace) -> dict[str, Any]:
         return settle()
     if command == "score":
         return score()
+    if command == "backtest":
+        return run_backtest(args.symbol, args.strategy, args.days)
+    if command == "live-check":
+        return live_check()
     return status()
 
 
@@ -605,11 +705,16 @@ def main(argv: list[str] | None = None) -> int:
         "reset-breaker": "clear a tripped circuit breaker, typed at the terminal",
         "settle": "score buy and sell cards five sessions after their as_of close",
         "score": "the desk's settled record: win rate, alpha against SPY, Brier, bootstrap CIs",
+        "backtest": "walk a rules baseline over adjusted history through the gate",
+        "live-check": "is the desk's record good enough to plan live money; exit 1 on FAIL",
     }
     parsers = {name: sub.add_parser(name, help=text) for name, text in commands.items()}
     parsers["propose"].add_argument("symbol")
     parsers["propose"].add_argument("--cik", help="SEC CIK: show the desk point in time facts")
     parsers["reject"].add_argument("prefix")
+    parsers["backtest"].add_argument("symbol")
+    parsers["backtest"].add_argument("--strategy", default=BASELINE, choices=backtest.STRATEGIES)
+    parsers["backtest"].add_argument("--days", type=int, default=BACKTEST_DAYS)
     for each in parsers.values():
         each.add_argument("--json", action="store_true", help="machine JSON on stdout")
     args = parser.parse_args(argv)
@@ -622,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(view, ensure_ascii=True, sort_keys=True))
     else:
         print("\n".join(_readable(args.command, view)))
-    return 0
+    return 1 if args.command == "live-check" and not view["passed"] else 0
 
 
 if __name__ == "__main__":
