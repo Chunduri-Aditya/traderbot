@@ -8,7 +8,6 @@ against its key, so an edited row no longer matches. `orders` maps a card to its
 """
 
 import json
-import os
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -19,11 +18,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from traderbot import paths
 from traderbot import proposal as prop
 from traderbot.gate import Deny, GateResult
 
-HOME_ENV = "TRADERBOT_HOME"
-DEFAULT_HOME = "~/.traderbot"
+HOME_ENV = paths.HOME_ENV
+DEFAULT_HOME = paths.DEFAULT_HOME
 KILL_SWITCH_FILE = "OFF"
 PREFIX_RE = re.compile(r"[0-9a-f]{8,64}")
 RESERVATION_TIMEOUT_S = 600  # twice the desk's 300 s call timeout
@@ -118,9 +118,7 @@ class Card:
 
 
 def home() -> Path:
-    root = Path(os.environ.get(HOME_ENV) or DEFAULT_HOME).expanduser()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return root
+    return paths.home()
 
 
 def path() -> Path:

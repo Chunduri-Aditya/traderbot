@@ -20,7 +20,9 @@ _Sequential milestones, one at a time. Committed. No dates: a phase is done when
 - [x] Positive control: Aditya ran `uv run traderbot approve` in Terminal.app, typed `5894fe66`, and paper order `f6c889d0` came back `accepted` (read back from Alpaca: SPY buy 1 limit 768.02 day).
 
 ## Phase 3: data
-- [ ] Calendar staleness, adjusted history, cache with retry, EDGAR point in time facts; a script proves `filed <= as_of` on a live fetch.
+- [x] `certifi` bumped to 2026.10.23 (PYSEC-2026-4320 closed; `pip-audit` reports none) (`e4afd14`).
+- [x] Calendar staleness (the as_of bar counts 16 minutes after the close, a partial window is never cached), RAW and adjusted history, `cache.py` with retry on transient errors only, EDGAR point in time facts; tests in `test_cache.py`, `test_data.py`, `test_fundamentals.py`.
+- [x] `scripts/pit_check.py` on a live fetch (cloud session, 2026-11-03): AAPL CIK 320193 at `as_of` 2026-11-02 chose the Q3 10-Q filed 2026-07-31 and none of the 463 facts the FY2026 10-K filed 2026-11-03 carries; `chosen=6 leaked=0`, exit 0.
 
 ## Phase 4: scoring and memory
 - [ ] Settlement after 5 sessions, alpha against SPY, Brier, bootstrap CI; report equals hand computed values.

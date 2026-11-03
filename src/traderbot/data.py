@@ -3,6 +3,13 @@
 `as_of` is the last closed session by the calendar. A session is closed at or after its close
 (half days included). A bar the free plan cannot yet serve whole, because SIP history is only
 served once it is 15 or more minutes old, is dropped, so a propose in that window reads stale.
+
+Two price series: RAW closes size orders and feed the live gate (`daily_bars`); split and
+dividend adjusted closes (`Adjustment.ALL`) feed settlement, desk context and backtests
+(`adjusted_daily_bars`, `history`). Calendar reads and complete history windows go through
+`cache`; an adjusted window is keyed by the ET date it was fetched, because a later split or
+dividend rewrites every adjusted close before it. A window whose `as_of` bar is not served whole
+yet is never cached. Every network read retries only transient failures.
 """
 
 from dataclasses import dataclass
@@ -19,11 +26,15 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Calendar
 from alpaca.trading.requests import GetCalendarRequest
 
+from traderbot import cache
 from traderbot.keychain import AlpacaKeys
 
 ET = ZoneInfo("America/New_York")
 SIP_DELAY = timedelta(minutes=16)  # 15 minutes per Alpaca's free plan, plus one spare
 LOOKBACK_DAYS = 45  # calendar days, enough for about 30 sessions
+CALENDAR_TTL_S = 86_400
+RAW_TTL_S = 7 * 86_400  # a closed raw bar does not change
+ADJUSTED_TTL_S = 86_400  # and the key carries the fetch date
 
 
 def now_et() -> datetime:
@@ -59,10 +70,34 @@ class Bars:
 
 
 def sessions(trading: TradingClient, start: date, end: date) -> list[Session]:
-    rows = trading.get_calendar(GetCalendarRequest(start=start, end=end))
+    rows = cache.retry_with_backoff(
+        lambda: trading.get_calendar(GetCalendarRequest(start=start, end=end))
+    )
     if not isinstance(rows, list):
         raise TypeError("calendar came back raw; the client must return models")
     return [_session(row) for row in rows]
+
+
+def cached_sessions(trading: TradingClient, start: date, end: date, now: datetime) -> list[Session]:
+    """`sessions` through the cache for a day; approve reads the live calendar instead."""
+    rows = cache.get_or_fetch(
+        "calendar",
+        f"{start.isoformat()}:{end.isoformat()}",
+        now,
+        CALENDAR_TTL_S,
+        lambda: [
+            [s.day.isoformat(), s.open.isoformat(), s.close.isoformat()]
+            for s in sessions(trading, start, end)
+        ],
+    )
+    return [
+        Session(
+            day=date.fromisoformat(day),
+            open=datetime.fromisoformat(opened),
+            close=datetime.fromisoformat(closed),
+        )
+        for day, opened, closed in rows
+    ]
 
 
 def _session(row: Calendar) -> Session:
@@ -100,26 +135,78 @@ def complete_closes(
     return sorted(keep)
 
 
-def daily_bars(trading: TradingClient, keys: AlpacaKeys, symbol: str, now: datetime) -> Bars:
-    window = sessions(trading, now.date() - timedelta(days=LOOKBACK_DAYS), now.date())
-    as_of = last_closed(window, now)
-    data_end = now - SIP_DELAY
+def _fetch_closes(
+    keys: AlpacaKeys, symbol: str, start: date, end: datetime, adjustment: Adjustment
+) -> list[tuple[date, Decimal]]:
+    """Every SIP daily close of `symbol` from `start` to `end`, as Alpaca serves it."""
     client = StockHistoricalDataClient(keys.key_id, keys.secret)
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
-        start=datetime.combine(window[0].day, datetime.min.time(), ET),
-        end=data_end,
+        start=datetime.combine(start, datetime.min.time(), ET),
+        end=end,
         feed=DataFeed.SIP,
-        adjustment=Adjustment.RAW,
+        adjustment=adjustment,
     )
-    barset = client.get_stock_bars(request)
+    barset = cache.retry_with_backoff(lambda: client.get_stock_bars(request))
     if not isinstance(barset, BarSet):
         raise TypeError("bars came back raw; the client must return models")
-    raw = [
+    return [
         (_bar_day(bar.timestamp), Decimal(str(bar.close))) for bar in barset.data.get(symbol, [])
     ]
-    closes = complete_closes(raw, as_of, data_end)
+
+
+def history(
+    keys: AlpacaKeys,
+    symbol: str,
+    start: date,
+    as_of: Session,
+    now: datetime,
+    adjustment: Adjustment,
+) -> list[tuple[date, Decimal]]:
+    """Complete daily closes from `start` through `as_of`, oldest first; cached once whole."""
+    data_end = now - SIP_DELAY
+
+    def fetch() -> list[tuple[date, Decimal]]:
+        return complete_closes(
+            _fetch_closes(keys, symbol, start, data_end, adjustment), as_of, data_end
+        )
+
+    if data_end < as_of.close:
+        return fetch()  # the as_of bar is not served whole yet: never cache a partial window
+    key = f"{symbol}:{adjustment.value}:{start.isoformat()}:{as_of.day.isoformat()}"
+    ttl = RAW_TTL_S
+    if adjustment != Adjustment.RAW:
+        key += f":fetched {now.date().isoformat()}"
+        ttl = ADJUSTED_TTL_S
+    rows = cache.get_or_fetch(
+        "bars",
+        key,
+        now,
+        ttl,
+        lambda: [[day.isoformat(), str(close)] for day, close in fetch()],
+    )
+    return [(date.fromisoformat(day), Decimal(close)) for day, close in rows]
+
+
+def _bars(
+    trading: TradingClient, keys: AlpacaKeys, symbol: str, now: datetime, adjustment: Adjustment
+) -> Bars:
+    window = cached_sessions(trading, now.date() - timedelta(days=LOOKBACK_DAYS), now.date(), now)
+    as_of = last_closed(window, now)
+    closes = history(keys, symbol, window[0].day, as_of, now, adjustment)
     if not closes:
         raise RuntimeError(f"no complete daily bars for {symbol} up to {as_of.day}")
     return Bars(symbol=symbol, as_of=as_of.day, bar_date=closes[-1][0], closes=tuple(closes))
+
+
+def daily_bars(trading: TradingClient, keys: AlpacaKeys, symbol: str, now: datetime) -> Bars:
+    """RAW closes for sizing and the gate; `Bars.stale` is true when the as_of bar is missing."""
+    return _bars(trading, keys, symbol, now, Adjustment.RAW)
+
+
+def adjusted_daily_bars(
+    trading: TradingClient, keys: AlpacaKeys, symbol: str, now: datetime
+) -> Bars:
+    """Split and dividend adjusted closes over the same window, for desk context."""
+    return _bars(trading, keys, symbol, now, Adjustment.ALL)
